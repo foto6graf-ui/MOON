@@ -9,7 +9,7 @@
   "font_size": 10,
   "show_labels": true,
   "matte_effect": 0.0,
-  "glass_color": "green",
+  "glass_color": "default",
   "startup_with_windows": false,
   "single_click_launch": true,
   "theme": "Dark",
