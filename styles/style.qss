@@ -1,0 +1,131 @@
+* {
+    font-family: "SF Pro Display", "Segoe UI", "Arial";
+    color: #F5F5F5;
+    letter-spacing: 0;
+}
+
+QMainWindow, QWidget#Root {
+    background: transparent;
+}
+
+QLabel#TitleLabel {
+    font-size: 24px;
+    font-weight: 600;
+    color: #F5F5F5;
+}
+
+QLineEdit#SearchBox {
+    min-height: 44px;
+    border-radius: 22px;
+    border: 1px solid rgba(255, 255, 255, 52);
+    background: rgba(255, 255, 255, 34);
+    padding: 0 18px;
+    font-size: 16px;
+    selection-background-color: #4DA3FF;
+}
+
+QLineEdit#SearchBox:focus {
+    border: 1px solid rgba(77, 163, 255, 190);
+    background: rgba(255, 255, 255, 48);
+}
+
+QComboBox#SortCombo {
+    min-height: 36px;
+    border-radius: 18px;
+    border: 1px solid rgba(255, 255, 255, 52);
+    background: rgba(255, 255, 255, 34);
+    padding: 0 14px;
+    font-size: 13px;
+}
+
+QComboBox#SortCombo:hover,
+QComboBox#SortCombo:focus {
+    background: rgba(255, 255, 255, 48);
+    border: 1px solid rgba(77, 163, 255, 150);
+}
+
+QComboBox#SortCombo::drop-down {
+    width: 24px;
+    border: none;
+}
+
+QComboBox#SortCombo QAbstractItemView {
+    outline: none;
+    border: 1px solid rgba(255, 255, 255, 70);
+    border-radius: 10px;
+    background: #181B27;
+    selection-background-color: rgba(77, 163, 255, 110);
+}
+
+QScrollArea#AppScrollArea,
+QWidget#AppScrollViewport {
+    background: transparent;
+    border: none;
+}
+
+QListWidget#SearchResultsList {
+    border: none;
+    border-radius: 22px;
+    outline: none;
+    background: rgba(255, 255, 255, 22);
+    padding: 10px;
+    font-size: 13px;
+}
+
+QListWidget#SearchResultsList::item {
+    border-radius: 16px;
+    padding: 8px 12px;
+    color: rgba(245, 245, 245, 220);
+}
+
+QListWidget#SearchResultsList::item:hover,
+QListWidget#SearchResultsList::item:selected {
+    background: rgba(77, 163, 255, 84);
+}
+
+QScrollBar:vertical {
+    width: 6px;
+    background: transparent;
+    margin: 6px 0;
+}
+
+QScrollBar::handle:vertical {
+    border-radius: 3px;
+    background: rgba(255,255,255,70);
+}
+
+QScrollBar::add-line:vertical,
+QScrollBar::sub-line:vertical {
+    height:0;
+}
+
+QScrollBar::handle:vertical {
+    min-height: 40px;
+    border-radius: 5px;
+    background: rgba(255, 255, 255, 70);
+}
+
+QScrollBar::add-line:vertical,
+QScrollBar::sub-line:vertical {
+    height: 0;
+}
+
+QMenu {
+    border-radius: 12px;
+    border: 1px solid rgba(255, 255, 255, 50);
+    background: rgba(35, 40, 72, 235);
+    padding: 6px;
+}
+
+QMenu::item {
+    padding: 8px 22px;
+    border-radius: 8px;
+}
+
+QMenu::item:selected {
+    background: rgba(77, 163, 255, 110);
+}
+
+QMessageBox {
+    background: #1A2240;
+}
