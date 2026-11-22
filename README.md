@@ -1,8 +1,8 @@
 # MOON Launchpad 🌙
 
-Modern application launcher for Windows built with Python and PySide6.
+A fast, customizable Windows app launcher with application search, mini folders, and a liquid-glass interface.
 
-MOON is a desktop Launchpad designed to provide fast access to installed applications through a modern glassmorphism interface.
+MOON helps you find and launch installed apps quickly. Organize apps into categories and mini folders, adjust the appearance, and use global shortcuts to open the launcher.
 
 ## 📸 Screenshots
 
