@@ -182,9 +182,11 @@ class GlassPane(QWidget):
         arr = self._backdrop.array()
         if arr is None:
             return
-        self._refracted = self._renderer.refract(
+        result = self._renderer.refract(
             arr, self._panel_origin_in_backdrop(), self._backdrop.dpr(), fast=fast
         )
+        if result is not None:
+            self._refracted = result
 
     def _on_backdrop_changed(self) -> None:
         self._refract()

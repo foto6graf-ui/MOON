@@ -87,6 +87,31 @@ class MagnifierCapture:
         _user32.DefWindowProcW.restype = ctypes.c_longlong
         _user32.DefWindowProcW.argtypes = [wintypes.HWND, wintypes.UINT,
                                            wintypes.WPARAM, wintypes.LPARAM]
+        _kernel32.GetModuleHandleW.restype = wintypes.HMODULE
+        _kernel32.GetModuleHandleW.argtypes = [wintypes.LPCWSTR]
+        _user32.CreateWindowExW.restype = wintypes.HWND
+        _user32.CreateWindowExW.argtypes = [
+            wintypes.DWORD, wintypes.LPCWSTR, wintypes.LPCWSTR, wintypes.DWORD,
+            ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int,
+            wintypes.HWND, wintypes.HMENU, wintypes.HINSTANCE, ctypes.c_void_p,
+        ]
+        _user32.DestroyWindow.argtypes = [wintypes.HWND]
+        _user32.DestroyWindow.restype = wintypes.BOOL
+        _user32.SetLayeredWindowAttributes.argtypes = [
+            wintypes.HWND, wintypes.DWORD, ctypes.c_ubyte, wintypes.DWORD,
+        ]
+        _user32.SetLayeredWindowAttributes.restype = wintypes.BOOL
+        _user32.ShowWindow.argtypes = [wintypes.HWND, ctypes.c_int]
+        _user32.ShowWindow.restype = wintypes.BOOL
+        _user32.MoveWindow.argtypes = [
+            wintypes.HWND, ctypes.c_int, ctypes.c_int, ctypes.c_int,
+            ctypes.c_int, wintypes.BOOL,
+        ]
+        _user32.MoveWindow.restype = wintypes.BOOL
+        _user32.InvalidateRect.argtypes = [wintypes.HWND, ctypes.c_void_p, wintypes.BOOL]
+        _user32.InvalidateRect.restype = wintypes.BOOL
+        _user32.UpdateWindow.argtypes = [wintypes.HWND]
+        _user32.UpdateWindow.restype = wintypes.BOOL
         _mag.MagInitialize.restype = wintypes.BOOL
         if not _mag.MagInitialize():
             raise RuntimeError("MagInitialize failed")
@@ -94,8 +119,9 @@ class MagnifierCapture:
         self._hinst = _kernel32.GetModuleHandleW(None)
         self._ensure_class()
 
-        W = _user32.GetSystemMetrics(78)    # SM_CXVIRTUALSCREEN
-        H = _user32.GetSystemMetrics(79)    # SM_CYVIRTUALSCREEN
+        W = _user32.GetSystemMetrics(78)
+        H = _user32.GetSystemMetrics(79)
+
         self._host = _user32.CreateWindowExW(
             _WS_EX_LAYERED | _WS_EX_TRANSPARENT | _WS_EX_TOOLWINDOW,
             "PyGlassMagHost", "pyglass-mag", _WS_POPUP, 0, 0, max(W, 1), max(H, 1),
@@ -112,6 +138,26 @@ class MagnifierCapture:
         if not self._magw:
             self.close()
             raise RuntimeError("magnifier control creation failed")
+
+        # Force Magnifier to use a strict 1:1 transform.
+        class _MAGTRANSFORM(ctypes.Structure):
+            _fields_ = [
+                ("v", (ctypes.c_float * 3) * 3)
+            ]
+
+        transform = _MAGTRANSFORM()
+        transform.v[0][0] = 1.0
+        transform.v[1][1] = 1.0
+        transform.v[2][2] = 1.0
+
+        _mag.MagSetWindowTransform.argtypes = [wintypes.HWND, ctypes.c_void_p]
+        _mag.MagSetWindowTransform.restype = wintypes.BOOL
+        if not _mag.MagSetWindowTransform(
+                self._magw,
+                ctypes.byref(transform),
+        ):
+            self.close()
+            raise RuntimeError("MagSetWindowTransform failed")
 
         _mag.MagSetWindowFilterList.restype = wintypes.BOOL
         _mag.MagSetWindowFilterList.argtypes = [wintypes.HWND, wintypes.DWORD,
@@ -149,31 +195,56 @@ class MagnifierCapture:
         wc.proc = cls._proc
         wc.hInst = _kernel32.GetModuleHandleW(None)
         wc.cls = "PyGlassMagHost"
+        _user32.RegisterClassW.argtypes = [ctypes.POINTER(WNDCLASS)]
+        _user32.RegisterClassW.restype = wintypes.ATOM
         atom = _user32.RegisterClassW(ctypes.byref(wc))
         cls._class_atom = atom or True       # truthy even if already registered
 
     def set_exclude(self, widget) -> None:
         """Set which window the magnifier leaves out of the capture."""
         self._exclude = widget
-        self._apply_filter()
+        if not self._apply_filter():
+            raise RuntimeError("MagSetWindowFilterList failed")
 
-    def _apply_filter(self) -> None:
-        # Re-asserted before every grab: setting the filter once (before the
-        # magnifier is shown/sourced) doesn't reliably take, which let the glass
-        # leak into its own backdrop and pile up while stationary.
+    def _apply_filter(self) -> bool:
+        """Exclude MOON and the hidden magnifier host from its own capture."""
+        handles = []
+
         if self._exclude is not None:
-            arr = (wintypes.HWND * 1)(int(self._exclude.winId()))
-            _mag.MagSetWindowFilterList(self._magw, _MW_FILTERMODE_EXCLUDE, 1, arr)
+            handles.append(int(self._exclude.winId()))
+
+        if getattr(self, "_host", None):
+            handles.append(int(self._host))
+
+        if not handles:
+            return False
+
+        arr = (wintypes.HWND * len(handles))(*handles)
+
+        return bool(_mag.MagSetWindowFilterList(
+            self._magw,
+            _MW_FILTERMODE_EXCLUDE,
+            len(handles),
+            arr,
+        ))
 
     # ------------------------------------------------------------------ capture
     def _on_scale(self, hw, srcdata, srch, dstdata, dsth, unclip, clip, dirty):
+        if self._frame is not None:
+            return True
+
         try:
             h, stride = srch.height, srch.stride
             if srcdata and h and stride:
-                self._frame = (ctypes.string_at(srcdata, stride * h),
-                               srch.width, h, stride)
+                self._frame = (
+                    ctypes.string_at(srcdata, stride * h),
+                    srch.width,
+                    h,
+                    stride,
+                )
         except Exception:
             self._frame = None
+
         return True
 
     def grab(self, x: int, y: int, w: int, h: int) -> np.ndarray | None:
@@ -184,10 +255,18 @@ class MagnifierCapture:
         if w < 1 or h < 1:
             return None
         self._frame = None
-        self._apply_filter()        # keep the excluded window out (must re-assert)
+        if not self._apply_filter():
+            return None
         # 1:1 capture: size the control to the source so there's no scaling.
         _user32.MoveWindow(self._magw, 0, 0, int(w), int(h), False)
-        _mag.MagSetWindowSource(self._magw, _RECT(int(x), int(y), int(x + w), int(y + h)))
+
+        if not _mag.MagSetWindowSource(
+            self._magw,
+            _RECT(int(x), int(y), int(x + w), int(y + h))
+        ):
+            return None
+
+
         _user32.InvalidateRect(self._magw, None, True)
         _user32.UpdateWindow(self._magw)            # synchronous paint → callback
         if self._frame is None:

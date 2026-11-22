@@ -44,6 +44,22 @@ MOON is a desktop Launchpad designed to provide fast access to installed applica
 - PyWin32
 - Custom PyGlass integration
 
+## Install on Windows
+
+Download `MOON-Setup-v1.0.6.exe` from the repository and run it. The installer places MOON in the current user's local application folder and adds Start Menu shortcuts. User settings are created on first launch and are not included in the installer.
+
+## Build on Windows
+
+Use Python 3.13 with the packages listed in `requirements.txt` and PyInstaller 6.21.0. From PowerShell in this folder, run:
+
+```powershell
+python -m PyInstaller --clean --noconfirm MOON.spec
+Copy-Item dist\MOON.exe Output\MOON-1.0.6.exe -Force
+.\build_installer.ps1
+```
+
+The installer embeds only the built application and its uninstaller. Keep `.env`, local settings, and credentials out of source control and release files.
+
 ## 📁 Project structure
 
 ```text

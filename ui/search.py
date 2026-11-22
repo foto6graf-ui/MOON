@@ -17,7 +17,7 @@ class SearchBox(QLineEdit):
     def __init__(self, parent: object | None = None) -> None:
         super().__init__(parent)
         self.setObjectName("SearchBox")
-        self.setPlaceholderText("Поиск приложений...")
+        self.setPlaceholderText("Поиск приложений…")
         self.setClearButtonEnabled(True)
         self.setMinimumHeight(44)
 

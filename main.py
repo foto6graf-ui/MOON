@@ -7,11 +7,12 @@ import sys
 from pathlib import Path
 
 from PySide6.QtCore import QCoreApplication, Qt
-from PySide6.QtGui import QGuiApplication
-from PySide6.QtWidgets import QApplication
+from PySide6.QtGui import QCursor, QGuiApplication
+from PySide6.QtWidgets import QApplication, QDialog
 
 from models.app_model import ApplicationCatalog
 from ui.launchpad import LaunchpadWindow
+from ui.welcome_dialog import WelcomeDialog
 
 
 def _load_stylesheet() -> str:
@@ -37,6 +38,13 @@ def main() -> int:
     app.setApplicationName("Launchpad")
     app.setOrganizationName("PythonLaunchpad")
     app.setStyleSheet(_load_stylesheet())
+
+    welcome = WelcomeDialog()
+    screen = QGuiApplication.screenAt(QCursor.pos()) or QGuiApplication.primaryScreen()
+    if screen is not None:
+        welcome.move(screen.availableGeometry().center() - welcome.rect().center())
+    if welcome.exec() != QDialog.DialogCode.Accepted:
+        return 0
 
     catalog = ApplicationCatalog()
     window = LaunchpadWindow(catalog=catalog)

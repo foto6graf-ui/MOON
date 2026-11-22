@@ -7,6 +7,7 @@ import logging
 import os
 import platform
 import re
+import shutil
 import subprocess
 from pathlib import Path
 from typing import TYPE_CHECKING, Iterable
@@ -82,14 +83,22 @@ UTILITY_WORDS = {
     "console",
 }
 SOCIAL_WORDS = {
+    "telegram",
+    "instagram",
+    "whatsapp",
+    "facebook",
+    "messenger",
+    "vk",
+    "вконтакте",
+    "odnoklassniki",
+    "одноклассники",
+    "discord",
+    "skype",
+    "zoom",
+    "teams",
+    "slack",
     "mail",
     "chat",
-    "slack",
-    "telegram",
-    "discord",
-    "teams",
-    "zoom",
-    "skype",
     "social",
 }
 
@@ -151,7 +160,7 @@ TECHNICAL_NAME_PREFIX = re.compile(
 LOGGER = logging.getLogger(__name__)
 
 
-def scan_installed_applications(*, show_system_apps: bool = False) -> list["ApplicationItem"]:
+def scan_installed_applications(*, show_system_apps: bool = True) -> list["ApplicationItem"]:
     """Scan applications on the current operating system."""
     system = platform.system().lower()
     if system == "windows":
@@ -223,7 +232,7 @@ def _deduplicate_applications(
         identity = normalized_launch_identity(target, app.app_user_model_id)
         if identity is None:
             continue
-        if not show_system_apps and _is_system_application(app):
+        if not show_system_apps and app.source_type != "builtin" and _is_system_application(app):
             hidden_system_count += 1
             continue
         previous = selected.get(identity)
@@ -444,17 +453,21 @@ def _scan_windows() -> list["ApplicationItem"]:
 
     apps: list[ApplicationItem] = []
 
+    # Основные пользовательские источники:
+    # меню Пуск и рабочий стол.
     roots = [
-        Path(os.environ.get("APPDATA", "")) / "Microsoft" / "Windows" / "Start Menu" / "Programs",
-        Path(os.environ.get("PROGRAMDATA", "")) / "Microsoft" / "Windows" / "Start Menu" / "Programs",
+        Path(os.environ.get("APPDATA", ""))
+        / "Microsoft"
+        / "Windows"
+        / "Start Menu"
+        / "Programs",
+        Path(os.environ.get("PROGRAMDATA", ""))
+        / "Microsoft"
+        / "Windows"
+        / "Start Menu"
+        / "Programs",
         Path(os.environ.get("USERPROFILE", "")) / "Desktop",
         Path(os.environ.get("PUBLIC", "")) / "Desktop",
-    ]
-
-    program_roots = [
-        Path(os.environ.get("ProgramFiles", "")),
-        Path(os.environ.get("ProgramFiles(x86)", "")),
-        Path(os.environ.get("LOCALAPPDATA", "")) / "Programs",
     ]
 
     for root in roots:
@@ -464,11 +477,27 @@ def _scan_windows() -> list["ApplicationItem"]:
         for shortcut in root.rglob("*.lnk"):
             target = _resolve_shortcut(shortcut)
             arguments = _resolve_shortcut_arguments(shortcut)
-            is_game = _is_game_launcher_target(shortcut.stem, target, arguments) or _looks_like_desktop_game_shortcut(shortcut, target)
-            if not is_game and not is_allowed_windows_app(shortcut.stem, target):
+
+            is_game = (
+                _is_game_launcher_target(shortcut.stem, target, arguments)
+                or _looks_like_desktop_game_shortcut(shortcut, target)
+            )
+
+            if not is_game and not is_allowed_windows_app(
+                shortcut.stem,
+                target,
+            ):
                 continue
 
-            category = AppCategory.GAMES if is_game else infer_category(shortcut.stem, f"{target} {arguments}")
+            category = (
+                AppCategory.GAMES
+                if is_game
+                else infer_category(
+                    shortcut.stem,
+                    f"{target} {arguments}",
+                )
+            )
+
             apps.append(
                 ApplicationItem(
                     name=shortcut.stem,
@@ -485,8 +514,10 @@ def _scan_windows() -> list["ApplicationItem"]:
 
         for shortcut in root.rglob("*.url"):
             url = _read_windows_url(shortcut)
+
             if not url or not _is_game_launch_uri(url):
                 continue
+
             apps.append(
                 ApplicationItem(
                     name=shortcut.stem,
@@ -499,28 +530,63 @@ def _scan_windows() -> list["ApplicationItem"]:
                     source_type="game_uri",
                 )
             )
-
-    for root in program_roots:
-        if not root.exists():
-            continue
-        for executable in root.glob("*/*.exe"):
-            if not is_allowed_windows_app(executable.stem, str(executable), require_exe=True):
-                continue
-            apps.append(
-                ApplicationItem(
-                    name=_clean_name(executable.stem),
-                    path=str(executable),
-                    icon_path=str(executable),
-                    executable=str(executable),
-                    category=infer_category(executable.stem, str(executable.parent)),
-                    visible_by_default=True,
-                    installed_at=_mtime(executable),
-                    source_type="program_files",
-                )
-            )
-
+    # Системные и зарегистрированные Windows-приложения.
     apps.extend(_scan_windows_registry())
+    # Игры Steam добавляются отдельно.
     apps.extend(_scan_steam_games())
+    # Keep core terminal tools searchable even when Windows did not create
+    # Start Menu shortcuts for them.
+    apps.extend(_scan_windows_terminal_tools())
+
+    uninstall_commands = _scan_windows_uninstall_commands()
+    for app in apps:
+        app.uninstall_command = uninstall_commands.get(normalize_application_name(app.name))
+
+    return apps
+
+
+def _scan_windows_terminal_tools() -> list["ApplicationItem"]:
+    from models.app_model import AppCategory, ApplicationItem
+
+    apps: list[ApplicationItem] = []
+    windows_terminal = shutil.which("wt.exe")
+    if not windows_terminal:
+        local_app_data = os.environ.get("LOCALAPPDATA")
+        alias = Path(local_app_data) / "Microsoft" / "WindowsApps" / "wt.exe" if local_app_data else None
+        if alias is not None and alias.exists():
+            windows_terminal = str(alias)
+    if windows_terminal and Path(windows_terminal).exists():
+        apps.append(
+            ApplicationItem(
+                name="Windows Terminal",
+                path=windows_terminal,
+                executable=windows_terminal,
+                icon_path=windows_terminal,
+                category=AppCategory.UTILITIES,
+                visible_by_default=False,
+                source_type="builtin",
+            )
+        )
+
+    windows_dir = Path(os.environ.get("WINDIR", r"C:\Windows"))
+    builtins = (
+        ("Command Prompt", windows_dir / "System32" / "cmd.exe"),
+        ("Windows PowerShell", windows_dir / "System32" / "WindowsPowerShell" / "v1.0" / "powershell.exe"),
+    )
+    for name, executable in builtins:
+        if not executable.exists():
+            continue
+        apps.append(
+            ApplicationItem(
+                name=name,
+                path=str(executable),
+                executable=str(executable),
+                icon_path=str(executable),
+                category=AppCategory.UTILITIES,
+                visible_by_default=False,
+                source_type="builtin",
+            )
+        )
     return apps
 
 
@@ -658,6 +724,51 @@ def _scan_windows_registry() -> list["ApplicationItem"]:
         except OSError:
             continue
     return apps
+
+
+def _scan_windows_uninstall_commands() -> dict[str, str]:
+    """Read registered uninstall commands, keyed by normalized display name."""
+    try:
+        import winreg
+    except ImportError:
+        return {}
+
+    location = r"SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall"
+    commands: dict[str, str] = {}
+    views = (winreg.KEY_WOW64_64KEY, winreg.KEY_WOW64_32KEY)
+    for hive in (winreg.HKEY_CURRENT_USER, winreg.HKEY_LOCAL_MACHINE):
+        for view in views:
+            try:
+                with winreg.OpenKey(hive, location, 0, winreg.KEY_READ | view) as root:
+                    subkey_count = winreg.QueryInfoKey(root)[0]
+                    for index in range(subkey_count):
+                        try:
+                            subkey_name = winreg.EnumKey(root, index)
+                            with winreg.OpenKey(root, subkey_name) as subkey:
+                                display_name = str(winreg.QueryValueEx(subkey, "DisplayName")[0]).strip()
+                                try:
+                                    uninstall_command = str(
+                                        winreg.QueryValueEx(subkey, "UninstallString")[0]
+                                    ).strip()
+                                except OSError:
+                                    uninstall_command = str(
+                                        winreg.QueryValueEx(subkey, "QuietUninstallString")[0]
+                                    ).strip()
+                        except (OSError, IndexError):
+                            continue
+                        if display_name and uninstall_command:
+                            commands.setdefault(
+                                normalize_application_name(display_name),
+                                uninstall_command,
+                            )
+            except OSError:
+                continue
+    return commands
+
+
+def windows_uninstall_registered(display_name: str) -> bool:
+    """Check whether Windows still lists an app's registered uninstaller."""
+    return normalize_application_name(display_name) in _scan_windows_uninstall_commands()
 
 
 def _scan_linux() -> list["ApplicationItem"]:

@@ -22,9 +22,11 @@ from __future__ import annotations
 
 import ctypes
 import ctypes.util
+import logging
 import shutil
 import subprocess
 import sys
+import time
 from pathlib import Path
 from tempfile import gettempdir
 
@@ -36,7 +38,11 @@ from PySide6.QtWidgets import QApplication, QWidget
 from .refract import qimage_to_array
 
 _SCREENCAPTURE = shutil.which("screencapture") if sys.platform == "darwin" else None
-
+LOGGER = logging.getLogger("moon.screen_backdrop")
+def _to_local(rect: QRect, screen) -> QRect:
+    """Translate a global (virtual-desktop) rect into this screen's own
+    local coordinate space, as QScreen.grabWindow() expects."""
+    return rect.translated(-screen.geometry().topLeft())
 
 def exclude_from_capture(widget: QWidget, exclude: bool = True) -> bool:
     """Exclude (or re-include) ``widget``'s native window from OS screen capture.
@@ -190,6 +196,8 @@ class WidgetBackdrop(Backdrop):
 
 
 class ScreenBackdrop(Backdrop):
+
+
     """Refract the live OS desktop behind a frameless top-level window.
 
     ``widget`` is that window — it is excluded from / hidden during capture so
@@ -199,6 +207,8 @@ class ScreenBackdrop(Backdrop):
     """
 
     is_live = True
+
+
 
     def __init__(
         self, widget: QWidget, *, interval_ms: int | None = None,
@@ -211,6 +221,7 @@ class ScreenBackdrop(Backdrop):
         self._use_screencapture = _SCREENCAPTURE is not None
         self._capture_margin = capture_margin   # logical px grabbed around the window
         self._prev = None                        # last grabbed array, for change-skip
+        self._skip_initial_capture = sys.platform == "win32"
         # Per-instance snapshot file so multiple desktop panes don't clobber /
         # capture each other through a shared path.
         self._snap_path = Path(gettempdir()) / f"pyglass_live_{id(self)}.png"
@@ -235,6 +246,10 @@ class ScreenBackdrop(Backdrop):
         self._timer.setInterval(interval_ms)
         self._timer.timeout.connect(self._start_grab)
 
+    def _to_screen_local(self, rect: QRect, screen) -> QRect:
+        """Convert virtual-desktop coordinates to coordinates local to screen."""
+        return rect.translated(-screen.geometry().topLeft())
+
     # ---- liveness state -------------------------------------------------
     @property
     def excluded(self) -> bool:
@@ -254,32 +269,32 @@ class ScreenBackdrop(Backdrop):
         grabbing itself AND stays visible to screen recording. Otherwise fall back
         to the global capture exclusion (macOS ``screencapture`` +
         ``NSWindowSharingNone``; or none → paused)."""
-        cap = self._make_capturer()
-        if cap is not None:
-            self._capturer = cap
-            self._excluded = True       # capture is clean (no hide, no global hide)
-            # A real capturer streams continuously — poll fast, not at the slow
-            # `screencapture` CLI cadence.
-            self._fast_ms = 120
-            self._slow_ms = 300
-            self._timer.setInterval(self._fast_ms)
-            return True
-        self._excluded = exclude_from_capture(self._widget)
+        self._capturer = self._make_capturer()
+        # Keep the cadence selected by the caller (or the platform default from
+        # __init__) instead of silently forcing every glass pane back to 120 ms.
+        self._timer.setInterval(self._fast_ms)
+        if self._capturer is not None:
+            # The platform capturer filters MOON from its own feed. Keep the
+            # window visible to desktop composition and other screen recorders.
+            self._excluded = True
+            provider = type(self._capturer).__name__
+        else:
+            self._excluded = exclude_from_capture(self._widget)
+            provider = "QScreen.grabWindow"
+        LOGGER.info(
+            "Screen capture configured: provider=%s excluded=%s",
+            provider, self._excluded,
+        )
         return self._excluded
 
     def _make_capturer(self):
-        """Build the platform window-excluding capturer, or None if unavailable."""
-        try:
-            if sys.platform == "win32":
-                from ._magnifier import MagnifierCapture, available
-                if available():
-                    return MagnifierCapture(self._widget)
-            elif sys.platform == "darwin":
-                from ._screencapturekit import ScreenCaptureKitCapture, available
-                if available():
-                    return ScreenCaptureKitCapture(self._widget)
-        except Exception:
-            return None
+        """Use the QScreen capture path used by the stable MOON build.
+
+        The native magnifier can feed the translucent launchpad back into its
+        own backdrop on some Windows compositions, which looks like a desktop
+        reflection. QScreen capture already has the window-exclusion and
+        hide-before-grab fallback needed by this widget.
+        """
         return None
 
     def set_live(self, on: bool) -> None:
@@ -347,21 +362,56 @@ class ScreenBackdrop(Backdrop):
                 pass
             self._capturer = None
 
+    def _clear_frame(self) -> None:
+        if self._array is None:
+            return
+        self._array = None
+        self._prev = None
+        self.changed.emit()
+
     def _grab_capturer(self, full: bool = False) -> None:
         """Capture via the per-stream capturer (Windows Magnification / macOS
         ScreenCaptureKit): the live screen with the glass filtered out — no hide,
         no global exclusion, stays recordable."""
-        screen = QApplication.primaryScreen()
+        screen = QApplication.screenAt(
+            self._widget.frameGeometry().center()
+        )
         if screen is None:
             return
+
+        current_screen = screen
+
+        if getattr(self, "_capture_screen", None) is not current_screen:
+            self._capture_screen = current_screen
+            self._prev = None
+            self._clear_frame()
+            if self._capturer is None:
+                self._capturer = self._make_capturer()
+                if self._capturer is None:
+                    self._excluded = False
+                    return
+
+            self._excluded = True
         dpr = screen.devicePixelRatio() or 1.0
         r = screen.virtualGeometry() if full else self._capture_rect()
+
+        frame_started = time.perf_counter()
         arr = self._capturer.grab(
-            int(r.x() * dpr), int(r.y() * dpr),
-            int(r.width() * dpr), int(r.height() * dpr),
+            int(r.x() * dpr),
+            int(r.y() * dpr),
+            int(r.width() * dpr),
+            int(r.height() * dpr),
         )
+
         if arr is not None:
             self._ingest_array(arr, r.topLeft(), dpr)
+            if self._prev is arr:
+                elapsed_ms = (time.perf_counter() - frame_started) * 1000
+                self._fast_ms = min(80, max(33, int(elapsed_ms * 1.4)))
+                if self._timer.interval() != self._fast_ms:
+                    self._timer.setInterval(self._fast_ms)
+        else:
+            self._clear_frame()
 
     def _load_snapshot(self) -> QImage | None:
         img = QImage(str(self._snap_path))
@@ -390,61 +440,97 @@ class ScreenBackdrop(Backdrop):
             self._ingest(img, vgeo.topLeft(), vgeo.width())
 
     def _capture_rect(self) -> QRect:
-        """Just the region behind the window (+margin for the refraction reach),
-        so the per-frame grab is a fraction of a full-screen capture."""
+        """Capture the region around the monitor where the window currently is."""
         m = self._capture_margin
         rect = self._widget.frameGeometry().adjusted(-m, -m, m, m)
-        screen = QApplication.primaryScreen()
+
+        screen = QApplication.screenAt(self._widget.frameGeometry().center())
         if screen is not None:
-            rect = rect.intersected(screen.virtualGeometry())
+            rect = rect.intersected(screen.geometry())
+
         return rect
 
     def _grab_sync(self, full: bool = False) -> None:
-        """Grab via Qt. Hides the window first only when it isn't excluded from
-        capture (otherwise it would grab itself); excluded → no hide → no flicker.
-
-        ``full`` forces a whole-virtual-desktop grab even when live — used at the
-        start of a drag so the move can re-slice it smoothly without per-frame
-        grabs (the cheap sub-rect only covers the region right behind the pane)."""
+        """Grab via Qt. Hides the window first only when it isn't excluded
+        from capture.
+        """
         w = self._widget
         must_hide = w.isVisible() and not self._excluded
+
         if must_hide:
             w.hide()
             QApplication.processEvents()
+
         img = origin = logical_w = None
+
         try:
             if self._use_screencapture and _SCREENCAPTURE is not None:
                 subprocess.run(
                     [_SCREENCAPTURE, "-x", "-t", "png", str(self._snap_path)],
-                    check=False, timeout=5,
+                    check=False,
+                    timeout=5,
                 )
+
                 img = self._load_snapshot()
                 screen = QApplication.primaryScreen()
+
                 if img is not None and screen is not None:
                     vgeo = screen.virtualGeometry()
                     origin, logical_w = vgeo.topLeft(), vgeo.width()
+
             else:
-                screen = QApplication.primaryScreen()
+                screen = QApplication.screenAt(
+                    self._widget.frameGeometry().center()
+                )
+
                 if screen is not None and self._excluded and not full:
-                    # Live: grab only the region behind the window (cheap, tracks
-                    # the window as it moves) — the window is excluded, so this
-                    # shows the desktop, not the glass.
+                    # Live: capture only the region behind the window.
                     r = self._capture_rect()
-                    img = screen.grabWindow(0, r.x(), r.y(), r.width(), r.height()).toImage()
+
+                    local = self._to_screen_local(r, screen)
+
+
+                    img = screen.grabWindow(
+                        0,
+                        local.x(),
+                        local.y(),
+                        local.width(),
+                        local.height(),
+                    ).toImage()
+
                     origin, logical_w = r.topLeft(), r.width()
+
                 elif screen is not None:
-                    # Full virtual-desktop grab: the paused fallback, and the
-                    # drag cache (so a move re-slices it smoothly, no clamp).
-                    vgeo = screen.virtualGeometry()
-                    img = screen.grabWindow(0).toImage()
-                    origin, logical_w = vgeo.topLeft(), vgeo.width()
+                    # Capture only the current monitor.
+                    geo = screen.geometry()
+
+                    local = self._to_screen_local(geo, screen)
+
+
+                    img = screen.grabWindow(
+                        0,
+                        local.x(),
+                        local.y(),
+                        local.width(),
+                        local.height(),
+                    ).toImage()
+
+                    origin, logical_w = geo.topLeft(), geo.width()
+
         except Exception:
             img = None
+
         if must_hide:
             w.show()
             w.raise_()
+
         if img is not None and not img.isNull() and origin is not None:
+            if self._skip_initial_capture and self._excluded:
+                self._skip_initial_capture = False
+                return
             self._ingest(img, origin, logical_w)
+        else:
+            self._clear_frame()
 
     # ---- dragging -------------------------------------------------------
     def prepare_drag(self) -> None:
@@ -456,7 +542,10 @@ class ScreenBackdrop(Backdrop):
         self._prev = None
         if self._capturer is not None:
             self._grab_capturer(full=True)
-        elif not self._use_screencapture:
+        elif not self._use_screencapture and sys.platform != "win32":
+            # QScreen.grabWindow is synchronous on Windows; a full-monitor
+            # capture here blocks the GUI during window dragging. Keep the
+            # most recent local backdrop frame instead.
             self._grab_sync(full=True)
 
     def end_drag(self) -> None:
@@ -478,10 +567,13 @@ class ScreenBackdrop(Backdrop):
                 self._timer.setInterval(self._slow_ms)
             return
         self._idle_grabs = 0
+
         if self._timer.interval() != self._fast_ms:
-            self._timer.setInterval(self._fast_ms)      # change seen → snap responsive
+            self._timer.setInterval(self._fast_ms)
+
         self._prev = arr
         self._origin = origin
         self._dpr = dpr
         self._array = arr
+
         self.changed.emit()

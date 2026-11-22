@@ -5,6 +5,7 @@ from __future__ import annotations
 import logging
 from pathlib import Path
 
+import numpy as np
 from PySide6.QtCore import QFileInfo, QRect, QSize, Qt
 from PySide6.QtGui import QColor, QIcon, QImage, QPainter, QPixmap
 from PySide6.QtWidgets import QApplication, QFileIconProvider, QStyle
@@ -18,7 +19,7 @@ class IconCache:
     def __init__(self, size: int = 72) -> None:
         self.size = size
         self._provider = QFileIconProvider()
-        self._cache: dict[tuple[str, str | None, str | None, int, int], QPixmap] = {}
+        self._cache: dict[tuple[str, str | None, str | None, int], QPixmap] = {}
         self._loaded_count = 0
         self._cache_hit_count = 0
         self._error_count = 0
@@ -41,7 +42,7 @@ class IconCache:
         )
 
     def pixmap_for(self, name: str, path: str | None, icon_path: str | None) -> QPixmap:
-        key = (name, path, icon_path, self.size, self._latest_modified_time(path, icon_path))
+        key = (name, path, icon_path, self.size)
         cached = self._cache.get(key)
         if cached is not None:
             self._cache_hit_count += 1
@@ -68,7 +69,9 @@ class IconCache:
         if icon.isNull():
             return QPixmap()
 
-        requested_side = max(256, self.size * 3)
+        # Avoid asking the shell for oversized icon rasters when cards render
+        # at 48–72 px. This reduces first-paint latency for large catalogs.
+        requested_side = max(128, self.size * 2)
         source = icon.pixmap(QSize(requested_side, requested_side))
         if source.isNull():
             return QPixmap()
@@ -98,60 +101,56 @@ class IconCache:
         return QPixmap.fromImage(canvas)
 
     def _icon_from_source(self, path: str | None, icon_path: str | None) -> QIcon:
-        for source in (icon_path, path):
+        """Load the icon from the actual application path first."""
+        seen: set[str] = set()
+        for source in (path, icon_path):
             if not source:
                 continue
-            source_path = Path(source)
-            if source_path.suffix.casefold() == ".lnk":
-                try:
-                    from utils.app_scanner import resolve_windows_shortcut
+            normalized_source = source.casefold()
+            if normalized_source in seen:
+                continue
+            seen.add(normalized_source)
 
-                    resolved = Path(resolve_windows_shortcut(source_path))
-                    if resolved.suffix.casefold() == ".exe" and resolved.exists():
-                        source_path = resolved
-                except (OSError, ValueError):
-                    pass
+            source_path = Path(source)
+
             if source_path.exists():
                 image_icon = self._icon_from_image(source_path)
                 if not image_icon.isNull():
                     return image_icon
+
                 icon = self._provider.icon(QFileInfo(str(source_path)))
                 if not icon.isNull():
                     return icon
+
             themed = QIcon.fromTheme(source)
             if not themed.isNull():
                 return themed
+
         return QIcon()
 
     @staticmethod
     def _opaque_bounds(image: QImage) -> QRect:
         """Return bounds of visible pixels without cropping opaque artwork."""
-        left = image.width()
-        top = image.height()
-        right = -1
-        bottom = -1
-        for y in range(image.height()):
-            for x in range(image.width()):
-                if image.pixelColor(x, y).alpha() > 8:
-                    left = min(left, x)
-                    top = min(top, y)
-                    right = max(right, x)
-                    bottom = max(bottom, y)
-        if right < left or bottom < top:
+        width = image.width()
+        height = image.height()
+        pixels = np.frombuffer(
+            image.constBits(),
+            dtype=np.uint8,
+            count=image.bytesPerLine() * height,
+        ).reshape(height, image.bytesPerLine())
+        alpha = pixels[:, 3:width * 4:4]
+        rows = np.flatnonzero(np.any(alpha > 8, axis=1))
+        columns = np.flatnonzero(np.any(alpha > 8, axis=0))
+        if rows.size == 0 or columns.size == 0:
             return QRect()
-        return QRect(left, top, right - left + 1, bottom - top + 1)
-
-    @staticmethod
-    def _latest_modified_time(path: str | None, icon_path: str | None) -> int:
-        latest = 0
-        for source in (icon_path, path):
-            if not source:
-                continue
-            try:
-                latest = max(latest, Path(source).stat().st_mtime_ns)
-            except OSError:
-                continue
-        return latest
+        left = int(columns[0])
+        top = int(rows[0])
+        return QRect(
+            left,
+            top,
+            int(columns[-1]) - left + 1,
+            int(rows[-1]) - top + 1,
+        )
 
     def _standard_application_icon(self, name: str) -> QPixmap:
         icon = QApplication.style().standardIcon(QStyle.StandardPixmap.SP_ComputerIcon)

@@ -6,6 +6,7 @@ from PySide6.QtCore import (
     QEasingCurve,
     QParallelAnimationGroup,
     QPropertyAnimation,
+    QPauseAnimation,
     QSequentialAnimationGroup,
     QPoint,
     QRect,
@@ -71,24 +72,52 @@ class Animator:
         """Build the Launchpad startup sequence."""
         sequence = QSequentialAnimationGroup(panel)
         panel_group = QParallelAnimationGroup(sequence)
-        panel_group.addAnimation(Animator.property_animation(panel, b"panelOpacity", 0.0, 1.0, 280))
-        panel_group.addAnimation(Animator.geometry_scale(panel, 0.94, 420))
+        panel_group.addAnimation(
+            Animator.property_animation(
+                panel,
+                b"panelOpacity",
+                0.0,
+                1.0,
+                210,
+                QEasingCurve.Type.OutCubic,
+            )
+        )
         sequence.addAnimation(panel_group)
 
-        for card in cards[:80]:
-            group = QParallelAnimationGroup(sequence)
-            group.addAnimation(Animator.property_animation(card, b"contentOpacity", 0.0, 1.0, 180))
-            group.addAnimation(Animator.slide(card, QPoint(0, 16), 220))
-            sequence.addAnimation(group)
+        cards_group = QParallelAnimationGroup(sequence)
+        for index, card in enumerate(cards[:24]):
+            card_sequence = QSequentialAnimationGroup(cards_group)
+            card_sequence.addAnimation(QPauseAnimation(index * 7, card_sequence))
+            card_sequence.addAnimation(
+                Animator.property_animation(
+                    card,
+                    b"contentOpacity",
+                    0.0,
+                    1.0,
+                    140,
+                    QEasingCurve.Type.OutCubic,
+                )
+            )
+            cards_group.addAnimation(card_sequence)
+        sequence.addAnimation(cards_group)
         return sequence
 
     @staticmethod
     def cards_sequence(parent: QWidget, cards: list[QWidget]) -> QSequentialAnimationGroup:
         """Build a staggered card-only entrance animation."""
-        sequence = QSequentialAnimationGroup(parent)
-        for card in cards[:80]:
-            group = QParallelAnimationGroup(sequence)
-            group.addAnimation(Animator.property_animation(card, b"contentOpacity", 0.0, 1.0, 160))
-            group.addAnimation(Animator.slide(card, QPoint(0, 14), 190))
-            sequence.addAnimation(group)
+        sequence = QParallelAnimationGroup(parent)
+        for index, card in enumerate(cards[:24]):
+            card_sequence = QSequentialAnimationGroup(sequence)
+            card_sequence.addAnimation(QPauseAnimation(index * 7, card_sequence))
+            card_sequence.addAnimation(
+                Animator.property_animation(
+                    card,
+                    b"contentOpacity",
+                    0.0,
+                    1.0,
+                    140,
+                    QEasingCurve.Type.OutCubic,
+                )
+            )
+            sequence.addAnimation(card_sequence)
         return sequence

@@ -18,10 +18,17 @@ PySide6 + local PyGlass integration.
 
 from __future__ import annotations
 
+import logging
+import sys
+
 from PySide6.QtCore import (
     Property,
     QPoint,
+    QObject,
+    QRunnable,
     QRectF,
+    QThreadPool,
+    Signal,
     Qt,
     QTimer,
 )
@@ -31,9 +38,14 @@ from PySide6.QtGui import (
     QPainter,
     QPainterPath,
     QPen,
+    QPixmap,
 )
 
 from PySide6.QtWidgets import QWidget
+
+
+
+LOGGER = logging.getLogger("moon.liquid_glass")
 
 
 # =========================================================
@@ -45,6 +57,7 @@ try:
     from pyglass_pyside import (
         GlassMaterial,
         GlassRenderer,
+        GlassStyle,
         ScreenBackdrop,
         paint_glass,
     )
@@ -61,6 +74,36 @@ except Exception as error:
 # =========================================================
 # LIQUID GLASS WIDGET
 # =========================================================
+
+class _RefractionSignals(QObject):
+    finished = Signal(int, int, object, str)
+
+
+class _RefractionTask(QRunnable):
+    def __init__(self, renderer, backdrop, origin, dpr, renderer_revision,
+                 backdrop_revision, fast, signals) -> None:
+        super().__init__()
+        self.renderer = renderer
+        self.backdrop = backdrop
+        self.origin = origin
+        self.dpr = dpr
+        self.fast = fast
+        self.renderer_revision = renderer_revision
+        self.backdrop_revision = backdrop_revision
+        self.signals = signals
+
+    def run(self) -> None:
+        try:
+            image = self.renderer.refract_image(
+                self.backdrop, self.origin, self.dpr, fast=self.fast
+            )
+            self.signals.finished.emit(
+                self.renderer_revision, self.backdrop_revision, image, ""
+            )
+        except Exception as error:
+            self.signals.finished.emit(
+                self.renderer_revision, self.backdrop_revision, None, str(error)
+            )
 
 class LiquidGlassWidget(QWidget):
 
@@ -87,7 +130,8 @@ class LiquidGlassWidget(QWidget):
         self.border_opacity = border_opacity
 
         self._panel_opacity = 1.0
-        self._matte_effect = 0.4
+        self._matte_effect = 0.2
+        self._glass_thickness = 0.5
         self._glass_color = "default"
         self._light_theme = False
 
@@ -107,6 +151,19 @@ class LiquidGlassWidget(QWidget):
         self._initialized = False
 
         self._backdrop_started = False
+        self._refraction_pool = QThreadPool(self)
+        self._refraction_pool.setMaxThreadCount(1)
+        self._refraction_signals = _RefractionSignals(self)
+        self._refraction_signals.finished.connect(self._on_refraction_finished)
+        self._renderer_revision = 0
+        self._backdrop_revision = 0
+        self._refraction_running = False
+        self._settle_timer = QTimer(self)
+        self._settle_timer.setSingleShot(True)
+        # Coalesce captures while keeping the glass responsive; pixel rendering
+        # happens in a worker so scrolling and input stay on the UI thread.
+        self._settle_timer.setInterval(33)
+        self._settle_timer.timeout.connect(self._settle_refraction)
 
 
         # -------------------------------------------------
@@ -187,42 +244,53 @@ class LiquidGlassWidget(QWidget):
     # =====================================================
     def set_matte_effect(self, value: float) -> None:
         self._matte_effect = max(0.0, min(1.0, float(value)))
-
-        if self._backdrop is None:
-            return
-
-        if self.width() <= 0 or self.height() <= 0:
-            return
-
         try:
-            self._material = GlassMaterial(
-                thickness=0.40,
-                frost=self._matte_effect,
-                strength=65.0,
-                bevel=32.0,
-                chroma=0.08,
-                reflect=0.18,
-                f0=0.012,
-            )
-
-            self._renderer = GlassRenderer(
-                self._material,
-                float(self.width()),
-                float(self.height()),
-                float(self.radius),
-            )
-
-            self._create_refraction()
+            self._material = self._make_material()
+            if self._renderer is not None:
+                self._replace_renderer()
+                self._request_refraction(renderer_changed=True)
             self.update()
 
         except Exception as error:
-            print("MOON matte effect error:", error)
+            LOGGER.exception("Matte effect update failed")
+
+    def set_glass_thickness(self, value: float) -> None:
+        self._glass_thickness = max(0.35, min(0.65, float(value)))
+        self._material = self._make_material()
+        if self._renderer is not None:
+            self._replace_renderer()
+            self._request_refraction(renderer_changed=True)
+        self.update()
+
+    def _make_material(self) -> GlassMaterial:
+        return GlassMaterial(
+            thickness=self._glass_thickness,
+            frost=self._matte_effect,
+            strength=24.0,
+            bevel=34.0,
+            chroma=0.02,
+            reflect=0.0,
+            f0=0.045,
+            disp_glow=32.0,
+            disp_sat=0.28,
+            disp_width=2.0,
+        )
+
+    def _replace_renderer(self) -> None:
+        self._renderer = GlassRenderer(
+            self._material,
+            float(self.width()),
+            float(self.height()),
+            float(self.radius),
+        )
 
     def set_glass_color(self, color: str) -> None:
-        self._glass_color = color
-
-        if color not in ("default", "green", "pink"):
+        legacy_colors = {"green": "#39e444", "pink": "#b90091"}
+        if color == "default":
             self._glass_color = "default"
+        else:
+            candidate = QColor(legacy_colors.get(color, color))
+            self._glass_color = candidate.name() if candidate.isValid() else "default"
 
         self.update()
 
@@ -246,7 +314,7 @@ class LiquidGlassWidget(QWidget):
         self.opacity = max(
             0,
             min(
-                255,
+                40,
                 alpha,
             ),
         )
@@ -266,6 +334,7 @@ class LiquidGlassWidget(QWidget):
 
             return None
 
+
         return window
 
 
@@ -282,10 +351,7 @@ class LiquidGlassWidget(QWidget):
 
         if not PYGLASS_AVAILABLE:
 
-            print(
-                "PyGlass unavailable:",
-                PYGLASS_ERROR,
-            )
+            LOGGER.error("PyGlass unavailable: %s", PYGLASS_ERROR)
 
             return
 
@@ -317,7 +383,7 @@ class LiquidGlassWidget(QWidget):
             self._material = GlassMaterial(
 
                 # Толщина стекла.
-                thickness=0.40,
+                thickness=self._glass_thickness,
 
 
                 # Матирование.
@@ -335,23 +401,26 @@ class LiquidGlassWidget(QWidget):
                 # 60 = сильное
                 # 80 = очень сильное
                 #
-                strength=65.0,
+                strength=24.0,
 
 
                 # Размер / мягкость края.
-                bevel=32.0,
+                bevel=34.0,
 
 
                 # Цветовое преломление.
-                chroma=0.08,
+                chroma=0.02,
 
 
                 # Отражение.
-                reflect=0.18,
+                reflect=0.0,
 
 
                 # Блик стекла.
-                f0=0.012,
+                f0=0.045,
+                disp_glow=32.0,
+                disp_sat=0.28,
+                disp_width=2.0,
 
             )
 
@@ -372,11 +441,16 @@ class LiquidGlassWidget(QWidget):
                 window,
 
                 # Обновление.
-                interval_ms=120,
+                # QScreen.grabWindow is synchronous on Windows. Keep the
+                # fallback capture at 4 FPS so it doesn't monopolize the UI
+                # thread while the user scrolls or moves the launchpad.
+                # macOS spawns a screencapture process for each frame, so it
+                # uses a still slower cadence.
+                interval_ms=900 if sys.platform == "darwin" else 250 if sys.platform == "win32" else 120,
 
 
                 # Запас вокруг окна.
-                capture_margin=180,
+                capture_margin=0,
 
             )
 
@@ -418,17 +492,12 @@ class LiquidGlassWidget(QWidget):
             self._initialized = True
 
 
-            print(
-                "MOON ScreenBackdrop initialized"
-            )
+            LOGGER.info("Screen backdrop initialized")
 
 
         except Exception as error:
 
-            print(
-                "MOON PyGlass setup error:",
-                error,
-            )
+            LOGGER.exception("PyGlass setup failed")
 
 
             self._material = None
@@ -474,10 +543,7 @@ class LiquidGlassWidget(QWidget):
             live = self._backdrop.configure()
 
 
-            print(
-                "MOON ScreenBackdrop configured:",
-                live,
-            )
+            LOGGER.info("Screen backdrop configured: live=%s", live)
 
 
             # =============================================
@@ -490,19 +556,15 @@ class LiquidGlassWidget(QWidget):
             self._backdrop_started = True
 
 
-            print(
-                "MOON ScreenBackdrop started"
-            )
+            LOGGER.info("Screen backdrop started")
 
 
         except Exception as error:
 
-            print(
-                "MOON ScreenBackdrop start error:",
-                error,
-            )
+            LOGGER.exception("Screen backdrop start failed")
 
     def pause_backdrop(self) -> None:
+        self._settle_timer.stop()
         if self._backdrop is None:
             return
 
@@ -510,7 +572,7 @@ class LiquidGlassWidget(QWidget):
             self._backdrop.stop()
             self._backdrop_started = False
         except Exception as error:
-            print("MOON ScreenBackdrop pause error:", error)
+            LOGGER.exception("Screen backdrop pause failed")
 
     def resume_backdrop(self) -> None:
         if self._backdrop is None:
@@ -520,10 +582,9 @@ class LiquidGlassWidget(QWidget):
             if not self._backdrop_started:
                 self._backdrop.start()
                 self._backdrop_started = True
-                self._create_refraction()
                 self.update()
         except Exception as error:
-            print("MOON ScreenBackdrop resume error:", error)
+            LOGGER.exception("Screen backdrop resume failed")
 
 
     # =====================================================
@@ -531,106 +592,70 @@ class LiquidGlassWidget(QWidget):
     # =====================================================
 
     def _on_backdrop_changed(self) -> None:
+        self._backdrop_revision += 1
+        if not self._settle_timer.isActive():
+            self._settle_timer.start()
 
-        self._create_refraction()
-
-        self.update()
+    def _settle_refraction(self) -> None:
+        self._create_refraction(fast=self._matte_effect <= 0.001)
 
 
     # =====================================================
     # CREATE REFRACTION
     # =====================================================
 
-    def _create_refraction(self) -> None:
-
-        if self._backdrop is None:
-
+    def _create_refraction(self, fast: bool = False) -> None:
+        if self._backdrop is None or self._renderer is None:
+            return
+        if self._refraction_running:
             return
 
-
-        if self._renderer is None:
-
+        background = self._backdrop.array()
+        if background is None:
             return
-
 
         try:
-
-            background = (
-
-                self._backdrop.array()
-
-            )
-
-
-            if background is None:
-
-                self._refracted = None
-
-                return
-
-
-            # =============================================
-            # IMPORTANT
-            #
-            # Позиция нашей панели
-            # относительно начала захваченного
-            # ScreenBackdrop.
-            # =============================================
-
-            panel_global = self.mapToGlobal(
-
-                QPoint(
-                    0,
-                    0,
-                )
-
-            )
-
-
-            backdrop_origin = (
-
-                self._backdrop.global_origin()
-
-            )
-
-
-            origin = (
-
-                panel_global
-                -
-                backdrop_origin
-
-            )
-
-
-            # =============================================
-            # REFRACTION
-            # =============================================
-
-            self._refracted = (
-
-                self._renderer.refract(
-
+            origin = self.mapToGlobal(QPoint(0, 0)) - self._backdrop.global_origin()
+            dpr = self._backdrop.dpr()
+            self._refraction_running = True
+            self._refraction_pool.start(
+                _RefractionTask(
+                    self._renderer,
                     background,
-
                     origin,
-
-                    self._backdrop.dpr(),
-
+                    dpr,
+                    self._renderer_revision,
+                    self._backdrop_revision,
+                    fast or self._matte_effect <= 0.001,
+                    self._refraction_signals,
                 )
-
             )
+        except Exception:
+            self._refraction_running = False
+            LOGGER.exception("PyGlass refraction scheduling failed")
 
+    def _request_refraction(self, *, renderer_changed: bool = False) -> None:
+        if renderer_changed:
+            self._renderer_revision += 1
+        if not self._settle_timer.isActive():
+            self._settle_timer.start()
 
-        except Exception as error:
+    def _on_refraction_finished(
+        self, renderer_revision: int, backdrop_revision: int, image, error: str
+    ) -> None:
+        self._refraction_running = False
+        if error:
+            LOGGER.error("PyGlass refraction failed: %s", error)
+        elif renderer_revision == self._renderer_revision and image is not None:
+            # QPixmap is GUI-thread-only; convert the detached QImage here.
+            self._refracted = QPixmap.fromImage(image)
+            self._refracted.setDevicePixelRatio(image.devicePixelRatio())
+            self.update()
 
-            print(
-                "MOON PyGlass refract error:",
-                error,
-            )
-
-
-            self._refracted = None
+        frame_is_stale = backdrop_revision != self._backdrop_revision
+        renderer_is_stale = renderer_revision != self._renderer_revision
+        if (frame_is_stale or renderer_is_stale) and not self._settle_timer.isActive():
+            self._settle_timer.start()
 
 
     # =====================================================
@@ -645,51 +670,17 @@ class LiquidGlassWidget(QWidget):
         super().resizeEvent(event)
 
 
-        # Renderer зависит от размера панели.
-
+        # Keep any in-flight task on its old renderer; the new one is built by
+        # the worker when it renders the latest size.
         self._renderer = None
-
         self._refracted = None
-
-
         if self._material is not None:
-
             try:
-
-                self._renderer = GlassRenderer(
-
-                    self._material,
-
-                    float(
-                        self.width()
-                    ),
-
-                    float(
-                        self.height()
-                    ),
-
-                    float(
-                        self.radius
-                    ),
-
-                )
-
-
-            except Exception as error:
-
-                print(
-                    "MOON renderer resize error:",
-                    error,
-                )
-
-
-        QTimer.singleShot(
-
-            0,
-
-            self._create_refraction,
-
-        )
+                self._replace_renderer()
+                if self._backdrop is not None:
+                    self._request_refraction(renderer_changed=True)
+            except Exception:
+                LOGGER.exception("Glass renderer resize failed")
 
 
     # =====================================================
@@ -747,10 +738,7 @@ class LiquidGlassWidget(QWidget):
 
         except Exception as error:
 
-            print(
-                "PyGlass refresh error:",
-                error,
-            )
+            LOGGER.exception("Screen backdrop refresh failed")
 
 
     # =====================================================
@@ -848,13 +836,6 @@ class LiquidGlassWidget(QWidget):
                 painter.save()
 
 
-                painter.setClipPath(
-
-                    path
-
-                )
-
-
                 painter.setOpacity(
 
                     self._panel_opacity
@@ -865,6 +846,15 @@ class LiquidGlassWidget(QWidget):
                 # =========================================
                 # REAL LIQUID GLASS
                 # =========================================
+
+                tint = QColor(self._glass_color) if self._glass_color != "default" else None
+                if tint is not None:
+                    tint.setAlpha(28)
+
+                # The slider is in percentage points (0..40). Convert that
+                # value to alpha directly so it has the same meaning for any
+                # captured backdrop.
+                white_fill_alpha = round(self.opacity * 255 / 100)
 
                 paint_glass(
 
@@ -879,27 +869,27 @@ class LiquidGlassWidget(QWidget):
                     self._refracted,
 
 
-                    # 1.0 = полностью видимый эффект.
+                     #1.0 = полностью видимый эффект.
+                    style=GlassStyle(
+                        shadow_layers=0,
+                        shadow_step=0.0,
+                        shadow_alpha=0,
+                        shadow_top=0.0,
+                        shadow_bottom=0.0,
+                        tint_top=white_fill_alpha,
+                        tint_bottom=round(white_fill_alpha * 0.6),
+                        sheen_alpha=max(5, min(16, int(self.border_opacity * 0.12))),
+                        sheen_extent=0.42,
+                        rim_top=int(self.border_opacity * 0.52),
+                        rim_mid=int(self.border_opacity * 0.16),
+                        rim_bottom=int(self.border_opacity * 0.34),
+                        rim_width=1.0,
+                    ),
                     reveal=1.0,
+                    color_tint=tint,
 
                 )
 
-
-                painter.restore()
-                
-                painter.save()
-
-                painter.setClipPath(path)
-
-                if self._glass_color == "green":
-                    tint = QColor(57, 228, 68, 28)
-                elif self._glass_color == "pink":
-                    tint = QColor(185, 0, 145, 28)
-                else:
-                    tint = None
-
-                if tint is not None:
-                    painter.fillPath(path, tint)
 
                 painter.restore()
 
@@ -924,11 +914,8 @@ class LiquidGlassWidget(QWidget):
 
 
                 light_alpha = int(
-
-                    self.opacity
-                    *
-                    self._panel_opacity
-
+                    min(24, self.opacity * 0.18)
+                    * self._panel_opacity
                 )
 
 
@@ -941,8 +928,6 @@ class LiquidGlassWidget(QWidget):
                         255,
                         255,
                         255,
-                        0,
-
                         light_alpha,
 
                     ),
@@ -955,10 +940,7 @@ class LiquidGlassWidget(QWidget):
 
             except Exception as error:
 
-                print(
-                    "MOON PyGlass render error:",
-                    error,
-                )
+                LOGGER.exception("PyGlass painting failed")
 
 
         # =================================================
@@ -991,17 +973,13 @@ class LiquidGlassWidget(QWidget):
                 path,
 
                 QColor(
-
-                    255,
-                    255,
-                    255,
-
-                    alpha,
-
+                    18,
+                    21,
+                    32,
+                    min(88, int(alpha * 0.55)),
                 ),
 
             )
-
 
             painter.restore()
 

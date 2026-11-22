@@ -1,6 +1,8 @@
 ﻿"""Main Launchpad window and adaptive application grid."""
 
 from __future__ import annotations
+import os
+import re
 from PySide6.QtWidgets import QApplication
 import logging
 from pathlib import Path
@@ -9,15 +11,18 @@ from utils.startup import set_startup_enabled
 
 from PySide6.QtCore import (
     QEasingCurve,
+    QElapsedTimer,
     QEvent,
     QObject,
     QPoint,
+    QProcess,
     QPropertyAnimation,
     QRect,
     QSize,
     QThread,
     QTimer,
     Qt,
+    QUrl,
     Signal,
     Slot,
 )
@@ -25,6 +30,7 @@ from PySide6.QtGui import (
     QAction,
     QColor,
     QCursor,
+    QDesktopServices,
     QGuiApplication,
     QKeySequence,
     QPainter,
@@ -33,6 +39,7 @@ from PySide6.QtGui import (
 )
 from PySide6.QtWidgets import (
     QButtonGroup,
+    QDialog,
     QFileDialog,
     QFrame,
     QGridLayout,
@@ -40,6 +47,7 @@ from PySide6.QtWidgets import (
     QLabel,
     QListWidget,
     QListWidgetItem,
+    QLineEdit,
     QMainWindow,
     QMessageBox,
     QInputDialog,
@@ -52,7 +60,8 @@ from PySide6.QtWidgets import (
 )
 
 from animations.animator import Animator
-from models.app_model import AppCategory, ApplicationCatalog, ApplicationItem, SortMode
+from models.app_model import AppCategory, AppFolder, ApplicationCatalog, ApplicationItem, SortMode
+from ui.app_folder_card import AppFolderCard
 from ui.app_card import AppCard
 from ui.popover_menu import GlassPopoverMenu, MenuNode
 from ui.search import SearchBox
@@ -62,6 +71,7 @@ from utils.app_scanner import (
     is_allowed_windows_app,
     resolve_windows_shortcut,
     reveal_in_file_manager,
+    windows_uninstall_registered,
 )
 from utils.backdrop import apply_native_backdrop
 from utils.global_hotkey import ModifierHotkeyWatcher
@@ -79,6 +89,7 @@ class ScannerWorker(QObject):
     """Background application scanner."""
 
     finished = Signal(list)
+    failed = Signal()
 
     def __init__(self, show_system_apps: bool) -> None:
         super().__init__()
@@ -93,7 +104,8 @@ class ScannerWorker(QObject):
             apps = scan_installed_applications(show_system_apps=self._show_system_apps)
         except Exception:
             LOGGER.exception("Application scan failed")
-            apps = []
+            self.failed.emit()
+            return
         self.finished.emit(apps)
 
 
@@ -103,8 +115,9 @@ class AppGrid(QWidget):
     app_activated = Signal(str)
     pin_requested = Signal(str)
     favorite_requested = Signal(str)
-    folder_requested = Signal(str)
     folder_drop_requested = Signal(str, str)
+    remove_requested = Signal(str)
+    folder_open_requested = Signal(str)
 
     def __init__(self, icon_cache: IconCache, parent: QWidget | None = None) -> None:
         super().__init__(parent)
@@ -113,9 +126,12 @@ class AppGrid(QWidget):
         self.setAutoFillBackground(False)
         self.setStyleSheet("background: transparent; border:none;")
         self._icon_cache = icon_cache
-        self._apps: list[ApplicationItem] = []
+        self._entries: list[tuple[str, AppFolder | ApplicationItem]] = []
+        self._all_apps: list[ApplicationItem] = []
         self._cards: list[AppCard] = []
+        self._tiles: list[QWidget] = []
         self._card_cache: dict[str, AppCard] = {}
+        self._folder_card_cache: dict[str, AppFolderCard] = {}
         self._columns = 1
         self._next_index = 0
         self._batch_size = 12
@@ -128,7 +144,7 @@ class AppGrid(QWidget):
         self._cell_width = 30
         self._cell_height = 30
         self._timer = QTimer(self)
-        self._timer.setInterval(16)
+        self._timer.setInterval(8)
         self._timer.timeout.connect(self._append_batch)
         self._layout = QGridLayout(self)
         self._layout.setContentsMargins(0, 4, 2, 30)
@@ -147,10 +163,36 @@ class AppGrid(QWidget):
         """Return the current column count."""
         return self._columns
 
-    def set_apps(self, apps: list[ApplicationItem]) -> None:
-        """Replace grid contents and lazy-create cards."""
+    def set_apps(
+        self,
+        apps: list[ApplicationItem],
+        folders: list[AppFolder] | None = None,
+        *,
+        show_folders: bool = True,
+    ) -> None:
+        """Show folder tiles and loose application cards in the main grid."""
         self._timer.stop()
-        self._apps = apps
+        self._all_apps = list(apps)
+        folder_map = {folder.folder_id: folder for folder in (folders or ())} if show_folders else {}
+        visible_ids = {app.item_id for app in apps}
+        anchored_ids = {
+            folder.folder_id
+            for folder in folder_map.values()
+            if folder.anchor_app_id in visible_ids
+        }
+        placed_folders: set[str] = set()
+        self._entries = []
+        for app in apps:
+            folder = folder_map.get(app.folder_id or "")
+            if folder is None:
+                self._entries.append(("app", app))
+                continue
+            if folder.folder_id in placed_folders:
+                continue
+            if folder.folder_id in anchored_ids and app.item_id != folder.anchor_app_id:
+                continue
+            self._entries.append(("folder", folder))
+            placed_folders.add(folder.folder_id)
         self._clear()
         self._update_cell_size()
         self._columns = self._calculate_columns()
@@ -173,13 +215,14 @@ class AppGrid(QWidget):
         self._show_labels = show_labels
         self._single_click_launch = single_click_launch
         self._forced_columns = forced_columns
-        self._forced_columns = 8
-        self._spacing = 6
+        self._spacing = spacing
         self._layout.setHorizontalSpacing(self._spacing)
         self._layout.setVerticalSpacing(self._spacing)
         self._update_cell_size()
         for card in self._card_cache.values():
             card.configure(icon_size, font_size, show_labels, single_click_launch)
+            self._apply_card_cell_size(card)
+        for card in self._folder_card_cache.values():
             self._apply_card_cell_size(card)
         self._columns = self._calculate_columns()
         self._relayout()
@@ -232,6 +275,9 @@ class AppGrid(QWidget):
             // (self._cell_width + self._spacing)
         )
 
+        if self._forced_columns > 0:
+            columns = min(columns, self._forced_columns)
+
         # Максимум 8 колонок.
         # Если ширины экрана не хватает — автоматически меньше.
         columns = min(columns, 8)
@@ -239,12 +285,23 @@ class AppGrid(QWidget):
         return columns
 
     def _append_batch(self) -> None:
-        end = min(len(self._apps), self._next_index + self._batch_size)
-        for index in range(self._next_index, end):
-            self._add_card(self._apps[index], index)
-        self._next_index = end
+        elapsed = QElapsedTimer()
+        elapsed.start()
+        processed = 0
+        while self._next_index < len(self._entries) and processed < self._batch_size:
+            index = self._next_index
+            kind, entry = self._entries[index]
+            if isinstance(entry, AppFolder):
+                self._add_folder_card(entry)
+            else:
+                self._add_card(entry, index)
+            self._next_index += 1
+            processed += 1
+            # Yield to input, paint and backdrop events on busy machines.
+            if elapsed.elapsed() >= 6:
+                break
         self._update_grid_height()
-        if self._next_index < len(self._apps):
+        if self._next_index < len(self._entries):
             self._timer.start()
         else:
             self._timer.stop()
@@ -256,8 +313,8 @@ class AppGrid(QWidget):
             card.launched.connect(self.app_activated)
             card.pin_requested.connect(self.pin_requested)
             card.favorite_requested.connect(self.favorite_requested)
-            card.folder_requested.connect(self.folder_requested)
             card.drop_requested.connect(self.folder_drop_requested)
+            card.remove_requested.connect(self.remove_requested)
             self._card_cache[app.item_id] = card
         else:
             card.app = app
@@ -269,16 +326,38 @@ class AppGrid(QWidget):
             self._single_click_launch,
         )
         self._apply_card_cell_size(card)
-        row, column = divmod(index, self._columns)
+        row, column = divmod(len(self._tiles), self._columns)
         self._layout.addWidget(card, row, column, Qt.AlignmentFlag.AlignCenter)
         self._cards.append(card)
+        self._tiles.append(card)
+
+    def _add_folder_card(self, folder: AppFolder) -> None:
+        members = [app for app in self.catalog_applications if app.folder_id == folder.folder_id]
+        card = self._folder_card_cache.get(folder.folder_id)
+        if card is None:
+            card = AppFolderCard(folder, members, self._icon_cache, self)
+            card.open_requested.connect(self.folder_open_requested)
+            card.app_dropped.connect(self.folder_drop_requested)
+            self._folder_card_cache[folder.folder_id] = card
+        else:
+            card.update_content(folder, members)
+            card.show()
+        self._apply_card_cell_size(card)
+        row, column = divmod(len(self._tiles), self._columns)
+        self._layout.addWidget(card, row, column, Qt.AlignmentFlag.AlignCenter)
+        self._tiles.append(card)
+
+    @property
+    def catalog_applications(self) -> list[ApplicationItem]:
+        """Applications currently represented by this grid's catalog snapshot."""
+        return self._all_apps
 
     def _relayout(self) -> None:
-        for card in self._cards:
-            self._layout.removeWidget(card)
-        for index, card in enumerate(self._cards):
+        for tile in self._tiles:
+            self._layout.removeWidget(tile)
+        for index, tile in enumerate(self._tiles):
             row, column = divmod(index, self._columns)
-            self._layout.addWidget(card, row, column, Qt.AlignmentFlag.AlignCenter)
+            self._layout.addWidget(tile, row, column, Qt.AlignmentFlag.AlignCenter)
         self._update_grid_height()
 
     def _clear(self) -> None:
@@ -288,6 +367,7 @@ class AppGrid(QWidget):
             if widget is not None:
                 widget.hide()
         self._cards.clear()
+        self._tiles.clear()
         self._update_grid_height()
 
     def _update_cell_size(self) -> None:
@@ -302,24 +382,27 @@ class AppGrid(QWidget):
             self._icon_size + label_height + 10,
         )
 
-    def _apply_card_cell_size(self, card: AppCard) -> None:
-        card.setFixedSize(QSize(self._cell_width, self._cell_height))
+    def _apply_card_cell_size(self, card: QWidget) -> None:
+        height = max(self._cell_height, 96) if isinstance(card, AppFolderCard) else self._cell_height
+        card.setFixedSize(QSize(self._cell_width, height))
 
     def _update_grid_height(self) -> None:
-        rows = 0
-        if self._cards:
-            rows = (len(self._cards) + max(1, self._columns) - 1) // max(1, self._columns)
         margins = self._layout.contentsMargins()
         height = margins.top() + margins.bottom()
-        if rows:
-            height += rows * self._cell_height + (rows - 1) * self._spacing
+        if self._tiles:
+            columns = max(1, self._columns)
+            row_heights = [
+                max(tile.height() for tile in self._tiles[start : start + columns])
+                for start in range(0, len(self._tiles), columns)
+            ]
+            height += sum(row_heights) + max(0, len(row_heights) - 1) * self._spacing
         if self.minimumHeight() != height:
             self.setMinimumHeight(height)
             self.updateGeometry()
 
 
 class SearchResultsList(QListWidget):
-    """Compact search results shown while the user types."""
+    """Application-only search results shown while the user types."""
 
     app_activated = Signal(str)
 
@@ -334,15 +417,14 @@ class SearchResultsList(QListWidget):
         self.itemActivated.connect(self._emit_activated)
         self.itemDoubleClicked.connect(self._emit_activated)
 
-    def set_apps(self, apps: list[ApplicationItem]) -> None:
-        """Refresh list rows from applications."""
+    def set_results(self, apps: list[ApplicationItem]) -> None:
+        """Refresh rows with application names and icons only."""
         self.clear()
         for app in apps[:500]:
             item = QListWidgetItem()
-            item.setText(f"{app.name}\n{app.path}")
-            item.setToolTip(app.path)
+            item.setText(app.name)
             item.setData(Qt.ItemDataRole.UserRole, app.item_id)
-            item.setSizeHint(QSize(100, 62))
+            item.setSizeHint(QSize(100, 54))
             item.setIcon(
                 self._icon_cache.pixmap_for(
                     app.name,
@@ -350,6 +432,10 @@ class SearchResultsList(QListWidget):
                     app.icon_path,
                 )
             )
+            self.addItem(item)
+        if not apps:
+            item = QListWidgetItem("Приложения не найдены")
+            item.setFlags(Qt.ItemFlag.NoItemFlags)
             self.addItem(item)
         if self.count():
             self.setCurrentRow(0)
@@ -377,6 +463,8 @@ class SearchResultsList(QListWidget):
 class LaunchpadWindow(QMainWindow):
     """Top-level glass Launchpad application."""
 
+    logout_requested = Signal()
+
     def __init__(self, catalog: ApplicationCatalog, parent: QWidget | None = None) -> None:
         super().__init__(parent)
         self.catalog = catalog
@@ -386,6 +474,7 @@ class LaunchpadWindow(QMainWindow):
         self.settings = self.settings_store.load()
         self._category: AppCategory | None = None
         self._custom_section: str | None = None
+        self._uninstall_processes: dict[str, QProcess] = {}
         self._scanner_thread: QThread | None = None
         self._scanner_worker: ScannerWorker | None = None
         self._active_animations: list[object] = []
@@ -393,13 +482,23 @@ class LaunchpadWindow(QMainWindow):
         self._refresh_timer.setSingleShot(True)
         self._refresh_timer.setInterval(45)
         self._refresh_timer.timeout.connect(self._refresh_grid)
+        self._focus_check_timer = QTimer(self)
+        self._focus_check_timer.setSingleShot(True)
+        self._focus_check_timer.setInterval(120)
+        self._focus_check_timer.timeout.connect(self._hide_if_focus_left)
+        self._focus_check_attempts = 0
         self._intro_played = False
         self._popover: GlassPopoverMenu | None = None
         self._sort_popover: GlassPopoverMenu | None = None
+        self._settings_dialog: InterfaceSettingsDialog | None = None
+        self._about_dialog: QMessageBox | None = None
+        self._folder_dialog: QDialog | None = None
         self._promoted_app_id: str | None = None
         self._global_hotkey = ModifierHotkeyWatcher(self)
         self._global_hotkey.activated.connect(self.toggle_visibility)
-        QApplication.instance().installEventFilter(self)
+        application = QApplication.instance()
+        application.installEventFilter(self)
+        application.applicationStateChanged.connect(self._application_state_changed)
 
         self.setWindowTitle("Приложения")
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
@@ -459,6 +558,7 @@ class LaunchpadWindow(QMainWindow):
 
 
     def closeEvent(self, event: object) -> None:
+        self._global_hotkey.stop()
         self.icon_cache.log_statistics()
         try:
             scanner_running = (
@@ -511,7 +611,10 @@ class LaunchpadWindow(QMainWindow):
             icon.setPixmap(self.style().standardIcon(QStyle.StandardPixmap.SP_DialogYesButton).pixmap(32, 32))
         title = QLabel("Приложения", self.panel)
         title.setObjectName("TitleLabel")
-        self.menu_button = HoverButton("...", self.panel, circular=True)
+        self.menu_button = HoverButton("", self.panel, circular=True, glass=True, icon_name="more")
+        self.menu_button.setCheckable(False)
+        self.menu_button.setToolTip("Меню")
+        self.menu_button.setAccessibleName("Меню MOON")
         self.menu_button.clicked.connect(self._show_theme_menu)
         header.addWidget(icon)
         header.addWidget(title)
@@ -549,16 +652,22 @@ class LaunchpadWindow(QMainWindow):
             }
 
             QScrollBar:vertical {
-                width: 6px;
-                background: transparent;
+                width: 10px;
+                margin: 4px 2px;
+                border-radius: 5px;
+                background: rgba(255, 255, 255, 10);
             }
 
             QScrollBar::handle:vertical {
-                min-height: 28px;
-                border-radius: 3px;
-                background: rgba(255, 255, 255, 78);
+                min-height: 36px;
+                border: 1px solid rgba(255, 255, 255, 32);
+                border-radius: 4px;
+                background: rgba(190, 184, 255, 115);
             }
 
+            QScrollBar::handle:vertical:hover { background: rgba(205, 200, 255, 180); }
+            QScrollBar::handle:vertical:pressed { background: rgba(224, 220, 255, 220); }
+            QScrollBar::add-page:vertical, QScrollBar::sub-page:vertical { background: transparent; }
             QScrollBar::add-line:vertical,
             QScrollBar::sub-line:vertical {
                 height: 0px;
@@ -583,6 +692,9 @@ class LaunchpadWindow(QMainWindow):
         self.grid.app_activated.connect(self.catalog.mark_opened)
         self.grid.pin_requested.connect(self._toggle_pin_for_app)
         self.grid.favorite_requested.connect(self._toggle_favorite_for_app)
+        self.grid.remove_requested.connect(self._remove_app_from_moon)
+        self.grid.folder_drop_requested.connect(self._create_folder_from_drop)
+        self.grid.folder_open_requested.connect(self._open_folder)
 
         scroll.setWidget(self.grid)
 
@@ -623,7 +735,8 @@ class LaunchpadWindow(QMainWindow):
 
         section_row.addItem(QSpacerItem(10, 10, QSizePolicy.Policy.Expanding))
 
-        self.sort_button = HoverButton("⇅", self.panel, circular=True)
+        self.sort_button = HoverButton("", self.panel, circular=True, glass=True, icon_name="sort")
+        self.sort_button.setAccessibleName("Сортировка приложений")
         self.sort_button.setToolTip("Сортировка")
         self.sort_button.setCheckable(False)
         self.sort_button.clicked.connect(self._show_sort_menu)
@@ -661,8 +774,11 @@ class LaunchpadWindow(QMainWindow):
         self._scanner_worker.moveToThread(self._scanner_thread)
         self._scanner_thread.started.connect(self._scanner_worker.run)
         self._scanner_worker.finished.connect(self._scanner_finished)
+        self._scanner_worker.failed.connect(self._scanner_failed)
         self._scanner_worker.finished.connect(self._scanner_thread.quit)
+        self._scanner_worker.failed.connect(self._scanner_thread.quit)
         self._scanner_worker.finished.connect(self._scanner_worker.deleteLater)
+        self._scanner_worker.failed.connect(self._scanner_worker.deleteLater)
         self._scanner_thread.finished.connect(self._clear_scanner_refs)
         self._scanner_thread.finished.connect(self._scanner_thread.deleteLater)
         self._scanner_thread.start()
@@ -673,28 +789,53 @@ class LaunchpadWindow(QMainWindow):
         self._scanner_thread = None
         self._scanner_worker = None
 
+    @Slot()
+    def _scanner_failed(self) -> None:
+        """Keep the current catalog intact if a background refresh fails."""
+        LOGGER.warning("Keeping existing application catalog after scan failure")
+
     @Slot(list)
     def _scanner_finished(self, apps: list[ApplicationItem]) -> None:
         """Apply scanned applications together with user-added shortcuts."""
+        known_apps = [*apps, *self._custom_app_items()]
+        hidden_paths = {self._storage_key(path) for path in self.settings.hidden_app_paths}
+        known_apps = [app for app in known_apps if self._storage_key(app.path) not in hidden_paths]
         self.catalog.set_applications(
-            [*apps, *self._custom_app_items()],
+            known_apps,
             show_system_apps=self.settings.show_system_apps,
         )
+        by_path = {self._storage_key(app.path): app.item_id for app in self.catalog.applications}
+        for saved_folder in self.settings.app_folders:
+            member_ids = [
+                by_path[self._storage_key(path)]
+                for path in saved_folder.get("apps", [])
+                if isinstance(path, str) and self._storage_key(path) in by_path
+            ]
+            if len(member_ids) >= 2:
+                anchor_path = saved_folder.get("anchor")
+                anchor_id = by_path.get(self._storage_key(anchor_path)) if isinstance(anchor_path, str) else None
+                self.catalog.create_folder(
+                    str(saved_folder["name"]),
+                    member_ids,
+                    anchor_app_id=anchor_id,
+                )
         LOGGER.info("Application catalog updated: displayed=%d", len(self.catalog.applications))
 
     def _play_intro(self) -> None:
-        bg_animation = QPropertyAnimation(self.background, b"overlayOpacity", self)
-        bg_animation.setStartValue(0.0)
-        bg_animation.setEndValue(0.0)
-        bg_animation.setDuration(120)
-        bg_animation.setEasingCurve(QEasingCurve.Type.OutCubic)
-        bg_animation.start(QPropertyAnimation.DeletionPolicy.DeleteWhenStopped)
         self.panel.setPanelOpacity(0.0)
         QTimer.singleShot(
             30,
-            lambda: self._run_animation(Animator.entrance_sequence(self.panel, self.grid.cards[:48])),
+            self._start_intro_animation,
         )
         self._intro_played = True
+
+    def _start_intro_animation(self) -> None:
+        animation = Animator.entrance_sequence(self.panel, self.grid.cards[:48])
+        self.panel.pause_backdrop()
+        animation.finished.connect(
+            lambda: QTimer.singleShot(150, self._resume_backdrop_if_menus_closed)
+        )
+        self._run_animation(animation)
 
     @Slot()
     def _schedule_refresh(self) -> None:
@@ -705,10 +846,10 @@ class LaunchpadWindow(QMainWindow):
         query = self.search.text().strip()
         apps = self.catalog.filtered(
             query,
-            self._category,
-            favorites_only=self.settings.favorites_only,
+            None if query else self._category,
+            favorites_only=self.settings.favorites_only and not query,
         )
-        if self._custom_section:
+        if self._custom_section and not query:
             section = self._custom_section.casefold()
             apps = [
                 app
@@ -717,7 +858,7 @@ class LaunchpadWindow(QMainWindow):
                 or section in app.path.casefold()
                 or section in app.category.value.casefold()
             ]
-        if self.settings.folders_only:
+        if self.settings.folders_only and not query:
             apps = [app for app in apps if app.folder_id is not None]
         if self._promoted_app_id:
             promoted_id = self._promoted_app_id
@@ -727,24 +868,24 @@ class LaunchpadWindow(QMainWindow):
         if query:
             self.grid_scroll.hide()
             self.search_results.show()
-            self.search_results.set_apps(apps)
+            self.search_results.set_results(apps)
             return
 
         self.search_results.hide()
         self.grid_scroll.show()
-        self.grid.set_apps(apps)
+        visible_folder_ids = {app.folder_id for app in apps if app.folder_id}
+        visible_folders = [
+            folder for folder in self.catalog.folders
+            if folder.folder_id in visible_folder_ids
+        ]
+        self.grid.set_apps(
+            apps,
+            visible_folders,
+            show_folders=not self.settings.folders_only,
+        )
         LOGGER.info("Application grid updated: apps=%d, columns=%d", len(apps), self.grid.columns)
         if self._promoted_app_id and apps and apps[0].item_id == self._promoted_app_id:
             QTimer.singleShot(0, self._focus_promoted_app)
-        if not self._intro_played and len(apps) <= 160:
-            QTimer.singleShot(0, self._animate_visible_cards)
-
-    def _animate_visible_cards(self) -> None:
-        for card in self.grid.cards[:80]:
-            card.setContentOpacity(0.0)
-        if self.grid.cards:
-            sequence = Animator.cards_sequence(self.grid, self.grid.cards)
-            self._run_animation(sequence)
 
     def _run_animation(self, animation: object) -> None:
         if hasattr(animation, "finished"):
@@ -797,8 +938,60 @@ class LaunchpadWindow(QMainWindow):
 
         self.show_centered()
 
+    @Slot(Qt.ApplicationState)
+    def _application_state_changed(self, state: Qt.ApplicationState) -> None:
+        if state != Qt.ApplicationState.ApplicationInactive or not self.isVisible():
+            return
+        self._schedule_focus_check()
+
+    def _schedule_focus_check(self) -> None:
+        """Check focus after Qt has finished transferring it between owned windows."""
+        if not self._focus_check_timer.isActive():
+            self._focus_check_attempts = 0
+        self._focus_check_timer.start()
+
+    def _hide_if_focus_left(self) -> None:
+        if not self.isVisible():
+            return
+        if self._about_dialog is not None and self._about_dialog.isVisible():
+            return
+        if self._settings_dialog is not None and self._settings_dialog.isVisible():
+            return
+        modal = QApplication.activeModalWidget()
+        if modal is not None and self.isAncestorOf(modal):
+            return
+        active_window = QApplication.activeWindow()
+        if active_window is None:
+            # Qt can briefly report no active window while a dialog closes or
+            # focus moves between native windows. Confirm the loss is stable.
+            self._focus_check_attempts += 1
+            if self._focus_check_attempts < 4:
+                self._focus_check_timer.start()
+                return
+        owned_windows = (
+            self,
+            self._popover,
+            self._sort_popover,
+            self._settings_dialog,
+            self._about_dialog,
+            self._folder_dialog,
+        )
+        focus_is_owned = active_window is not None and any(
+            window is not None
+            and (active_window is window or window.isAncestorOf(active_window))
+            for window in owned_windows
+        )
+        if focus_is_owned:
+            self._focus_check_attempts = 0
+            return
+        if self._folder_dialog is not None and self._folder_dialog.isVisible():
+            self._folder_dialog.close()
+        self.hide()
+
     def show_centered(self) -> None:
         """Show the menu centred in the work area of the current screen."""
+        self._focus_check_timer.stop()
+        self._focus_check_attempts = 0
         self._center_on_current_screen()
         self.show()
         self.raise_()
@@ -864,8 +1057,14 @@ class LaunchpadWindow(QMainWindow):
             return
         if self._sort_popover and self._sort_popover.isVisible():
             self._sort_popover.close()
-            self.panel.pause_backdrop()
-        self._popover = GlassPopoverMenu(self._menu_nodes(), self)
+        # The popup is a separate native window. Keep the screen capture frozen
+        # while it is visible so it cannot be sampled back into the glass panel.
+        self.panel.pause_backdrop()
+        self._popover = GlassPopoverMenu(
+            self._menu_nodes(), self,
+            title="MOON",
+            subtitle="Быстрые действия",
+        )
         self._popover.closed.connect(self._theme_menu_closed)
         point = self.menu_button.mapToGlobal(
             QPoint(self.menu_button.width() - self._popover.width(), self.menu_button.height() + 8)
@@ -879,8 +1078,14 @@ class LaunchpadWindow(QMainWindow):
             return
         if self._popover and self._popover.isVisible():
             self._popover.close()
-            self.panel.pause_backdrop()
-        self._sort_popover = GlassPopoverMenu(self._sort_menu_nodes(), self)
+        # Qt.Popup is a separate top-level window and is included in desktop
+        # captures unless the glass backdrop is paused first.
+        self.panel.pause_backdrop()
+        self._sort_popover = GlassPopoverMenu(
+            self._sort_menu_nodes(), self,
+            title="СОРТИРОВКА",
+            subtitle="Порядок отображения приложений",
+        )
         self._sort_popover.closed.connect(self._sort_menu_closed)
         point = self.sort_button.mapToGlobal(
             QPoint(self.sort_button.width() - self._sort_popover.width(), self.sort_button.height() + 8)
@@ -889,13 +1094,23 @@ class LaunchpadWindow(QMainWindow):
         LOGGER.info("Sort menu opened")
 
     def _theme_menu_closed(self) -> None:
-        self.panel.resume_backdrop()
         self._popover = None
+        QTimer.singleShot(120, self._resume_backdrop_if_menus_closed)
         LOGGER.info("Settings menu closed")
 
     def _sort_menu_closed(self) -> None:
         self._sort_popover = None
+        QTimer.singleShot(120, self._resume_backdrop_if_menus_closed)
         LOGGER.info("Sort menu closed")
+
+    def _resume_backdrop_if_menus_closed(self) -> None:
+        theme_open = self._popover is not None and self._popover.isVisible()
+        sort_open = self._sort_popover is not None and self._sort_popover.isVisible()
+        settings_open = self._settings_dialog is not None and self._settings_dialog.isVisible()
+        about_open = self._about_dialog is not None and self._about_dialog.isVisible()
+        folder_open = self._folder_dialog is not None and self._folder_dialog.isVisible()
+        if not theme_open and not sort_open and not settings_open and not about_open and not folder_open:
+            self.panel.resume_backdrop()
 
     def _action(self, text: str, callback: object) -> QAction:
         action = QAction(text, self)
@@ -905,34 +1120,59 @@ class LaunchpadWindow(QMainWindow):
     def _menu_nodes(self) -> list[MenuNode]:
         return [
             MenuNode(
-                "⌕",
+                "search",
                 "Показывать поиск",
                 self._action("search", self._toggle_search),
                 checkable=True,
                 checked=self.settings.show_search,
+                detail="Показать или скрыть строку поиска",
             ),
             MenuNode(
-                "⚙",
+                "settings",
                 "Настройки",
                 self._action("settings", self._open_settings),
+                detail="Внешний вид и поведение MOON",
             ),
             MenuNode(
-                "ⓘ",
-                "О программе",
+                "about",
+                "О MOON",
                 self._action("about", self._about),
+                detail="Информация о приложении",
             ),
             MenuNode(
-                "×",
-                "Выход",
+                "exit",
+                "Выйти из MOON",
                 self._action("exit", self.close),
+                detail="Закрыть окно MOON",
             ),
         ]
 
     def _sort_menu_nodes(self) -> list[MenuNode]:
         return [
-            MenuNode("A", "По имени", self._action("sort_name", lambda: self._set_sort(SortMode.NAME)), checkable=True, checked=self.settings.sort_mode == SortMode.NAME.value),
-            MenuNode("★", "Часто используемые", self._action("sort_used", lambda: self._set_sort(SortMode.MOST_USED)), checkable=True, checked=self.settings.sort_mode == SortMode.MOST_USED.value),
-            MenuNode("⌂", "Закреплённые сверху", self._action("pin_first", self._toggle_pin_favorites_first), checkable=True, checked=self.settings.pin_favorites_first),
+            MenuNode(
+                "sort_name",
+                "Название · А–Я",
+                self._action("sort_name", lambda: self._set_sort(SortMode.NAME)),
+                checkable=True,
+                checked=self.settings.sort_mode == SortMode.NAME.value,
+                detail="По алфавиту",
+            ),
+            MenuNode(
+                "clock",
+                "Часто используемые",
+                self._action("sort_used", lambda: self._set_sort(SortMode.MOST_USED)),
+                checkable=True,
+                checked=self.settings.sort_mode == SortMode.MOST_USED.value,
+                detail="Сначала запускаемые чаще",
+            ),
+            MenuNode(
+                "pin",
+                "Закреплённые сверху",
+                self._action("pin_first", self._toggle_pin_favorites_first),
+                checkable=True,
+                checked=self.settings.pin_favorites_first,
+                detail="Избранное в начале списка",
+            ),
         ]
 
     def _add_custom_section(self) -> None:
@@ -1008,6 +1248,11 @@ class LaunchpadWindow(QMainWindow):
         }
         if not any(app.get("path", "").casefold() == path.casefold() for app in self.settings.custom_apps):
             self.settings.custom_apps.append(entry)
+            hidden_key = self._storage_key(path)
+            self.settings.hidden_app_paths = [
+                item for item in self.settings.hidden_app_paths
+                if self._storage_key(item) != hidden_key
+            ]
             self._save_settings()
         self.catalog.add_application(
             ApplicationItem(
@@ -1021,7 +1266,25 @@ class LaunchpadWindow(QMainWindow):
         )
 
     def _save_settings(self) -> None:
-        self.settings_store.save(self.settings)
+        app_paths = {app.item_id: self._storage_key(app.path) for app in self.catalog.applications}
+        self.settings.app_folders = [
+            {
+                "name": folder.name,
+                "apps": [app_paths[app_id] for app_id in folder.app_ids if app_id in app_paths],
+                "anchor": app_paths.get(folder.anchor_app_id),
+            }
+            for folder in self.catalog.folders
+            if sum(app_id in app_paths for app_id in folder.app_ids) >= 2
+        ]
+        try:
+            self.settings_store.save(self.settings)
+        except OSError as error:
+            LOGGER.exception("Could not save settings")
+            QMessageBox.warning(
+                self,
+                "Не удалось сохранить настройки",
+                f"Параметры применены до закрытия MOON, но не записались в файл настроек: {error}",
+            )
 
     def _apply_loaded_settings(self) -> None:
         try:
@@ -1034,8 +1297,15 @@ class LaunchpadWindow(QMainWindow):
         self.search.setVisible(self.settings.show_search)
         self.panel.set_panel_alpha(self.settings.panel_opacity)
         self.panel.set_matte_effect(self.settings.matte_effect)
+        self.panel.set_glass_thickness(self.settings.glass_thickness)
         self.panel.set_glass_color(self.settings.glass_color)
-        self._set_theme(ThemeMode.DARK, save=False)
+        try:
+            theme_mode = ThemeMode(self.settings.theme)
+        except ValueError:
+            theme_mode = ThemeMode.DARK
+        self._set_theme(theme_mode, save=False)
+        if self.settings.background_mode in {"blur", "gradient"}:
+            self._apply_background(self.settings.background_mode)
         self._apply_grid_settings()
 
     def _apply_grid_settings(self) -> None:
@@ -1087,23 +1357,29 @@ class LaunchpadWindow(QMainWindow):
         reveal_in_file_manager(str(self.settings_store.path))
 
     def _set_theme(self, mode: ThemeMode, *, save: bool = True) -> None:
-        self.settings.theme = ThemeMode.DARK.value
-        self.theme.set_mode(ThemeMode.DARK)
+        self.settings.theme = mode.value
+        self.theme.set_mode(mode)
+        self._apply_theme()
         if save:
             self._save_settings()
 
     def _set_background(self, mode: str) -> None:
+        if mode not in {"gradient", "blur"}:
+            return
         self.settings.background_mode = mode
+        self._apply_background(mode)
+        self._save_settings()
+
+    def _apply_background(self, mode: str) -> None:
         if mode == "gradient":
             self.background.setOverlayOpacity(0.08)
         elif mode == "blur":
             self.background.setOverlayOpacity(0.0)
-        self._save_settings()
 
     def _cycle_panel_opacity(self) -> None:
-        values = [65, 85, 105, 125, 145]
+        values = [8, 16, 24, 32, 40]
         current = self.settings.panel_opacity
-        self.settings.panel_opacity = values[(values.index(current) + 1) % len(values)] if current in values else 105
+        self.settings.panel_opacity = values[(values.index(current) + 1) % len(values)] if current in values else 20
         self.panel.set_panel_alpha(self.settings.panel_opacity)
         self._save_settings()
 
@@ -1155,27 +1431,85 @@ class LaunchpadWindow(QMainWindow):
         self._save_settings()
 
     def _open_settings(self) -> None:
+        QTimer.singleShot(0, self._show_settings_dialog)
+
+    def _show_settings_dialog(self) -> None:
+        if self._settings_dialog is not None and self._settings_dialog.isVisible():
+            self._settings_dialog.raise_()
+            self._settings_dialog.activateWindow()
+            return
         dialog = InterfaceSettingsDialog(self.settings, self)
+        self._settings_dialog = dialog
+        dialog.settings_previewed.connect(self._preview_settings)
         dialog.settings_applied.connect(self._settings_applied)
-        dialog.exec()
+        dialog.finished.connect(self._settings_dialog_finished)
+        dialog.finished.connect(dialog.deleteLater)
+        dialog.ensurePolished()
+        dialog.adjustSize()
+        center = self.frameGeometry().center()
+        screen = QGuiApplication.screenAt(center) or QGuiApplication.primaryScreen()
+        if screen is not None:
+            available = screen.availableGeometry()
+            x = max(
+                available.left(),
+                min(center.x() - dialog.width() // 2, available.right() - dialog.width() + 1),
+            )
+            y = max(
+                available.top(),
+                min(center.y() - dialog.height() // 2, available.bottom() - dialog.height() + 1),
+            )
+            dialog.move(x, y)
+        self.panel.pause_backdrop()
+        apply_native_backdrop(int(dialog.winId()))
+        dialog.open()
+
+    def _settings_dialog_finished(self, _result: int) -> None:
+        # Ignore a pending focus-loss check caused by activating the dialog.
+        self._focus_check_timer.stop()
+        dialog = self._settings_dialog
+        self._settings_dialog = None
+        if dialog is not None:
+            dialog.stop_pending_preview()
+        if dialog is not None and not dialog.settings_were_applied:
+            self._preview_settings(self.settings)
+        # Let the native settings window leave the desktop compositor before
+        # refreshing the glass snapshot, avoiding a reflected ghost frame.
+        QTimer.singleShot(180, self._resume_backdrop_if_menus_closed)
+
+    def _preview_settings(self, settings: InterfaceSettings) -> None:
+        self.panel.set_panel_alpha(settings.panel_opacity)
+        self.panel.set_matte_effect(settings.matte_effect)
+        self.panel.set_glass_thickness(settings.glass_thickness)
+        self.panel.set_glass_color(settings.glass_color)
 
     def _settings_applied(self, settings: InterfaceSettings) -> None:
         self.settings = settings
+        self._preview_settings(self.settings)
 
-        self.panel.set_panel_alpha(self.settings.panel_opacity)
-        self.panel.set_matte_effect(self.settings.matte_effect)
-        self.panel.set_glass_color(self.settings.glass_color)
-
-        set_startup_enabled(self.settings.startup_with_windows)
+        try:
+            set_startup_enabled(self.settings.startup_with_windows)
+        except OSError as error:
+            self.settings.startup_with_windows = False
+            QMessageBox.warning(
+                self,
+                "Автозагрузка MOON",
+                f"Не удалось изменить автозагрузку Windows: {error}",
+            )
 
         self._apply_grid_settings()
         self._save_settings()
-        self._start_scanner()
 
     def _about(self) -> None:
-        QMessageBox.information(
-            self,
-            "О программе",
+        if self._about_dialog is not None and self._about_dialog.isVisible():
+            self._about_dialog.raise_()
+            self._about_dialog.activateWindow()
+            return
+        dialog = QMessageBox(self)
+        dialog.setWindowTitle("О программе")
+        dialog.setIcon(QMessageBox.Icon.Information)
+        dialog.setStandardButtons(QMessageBox.StandardButton.Ok)
+        dialog.setModal(True)
+        dialog.setText(
             "MOON Launchpad\n\n"
             "Ваше пространство для приложений.\n\n"
             "MOON — современный лаунчер для Windows, созданный для "
@@ -1191,8 +1525,21 @@ class LaunchpadWindow(QMainWindow):
             "• Плавные анимации\n"
             "• Персонализация интерфейса\n\n"
             "MOON 1.0\n"
-            "Python • PySide6 • Qt6",
+            "Python • PySide6 • Qt6"
         )
+        self._about_dialog = dialog
+        dialog.finished.connect(self._about_dialog_finished)
+        dialog.finished.connect(dialog.deleteLater)
+        self.panel.pause_backdrop()
+        dialog.open()
+
+    def _about_dialog_finished(self, _result: int) -> None:
+        self._focus_check_timer.stop()
+        self._about_dialog = None
+        # Let the native dialog disappear from the desktop compositor before
+        # the glass captures a fresh frame, otherwise its pixels can linger as
+        # a doubled image behind the panel.
+        QTimer.singleShot(180, self._resume_backdrop_if_menus_closed)
 
     def _apply_theme(self) -> None:
         light = self.theme.mode == ThemeMode.LIGHT
@@ -1201,24 +1548,280 @@ class LaunchpadWindow(QMainWindow):
         self.style().unpolish(self)
         self.style().polish(self)
 
-    def _create_folder_from_single(self, app_id: str) -> None:
-        app = self.catalog.find(app_id)
-        if app is None:
-            return
-        folder = self.catalog.create_folder(f"Папка {app.name}", [app_id])
-        QMessageBox.information(self, "Папка создана", f'Создана папка "{folder.name}".')
+    @staticmethod
+    def _storage_key(path: str) -> str:
+        return str(Path(path).expanduser()).casefold().replace("/", "\\").rstrip("\\")
 
     def _create_folder_from_drop(self, source_id: str, target_id: str) -> None:
         source = self.catalog.find(source_id)
-        target = self.catalog.find(target_id)
-        if source is None or target is None:
+        if source is None:
             return
-        folder = self.catalog.create_folder("Новая папка", [source_id, target_id])
-        QMessageBox.information(
-            self,
-            "Папка создана",
-            f'Создана папка "{folder.name}" для {source.name} и {target.name}.',
+        target = self.catalog.find(target_id)
+        if target is not None:
+            if source.folder_id and source.folder_id == target.folder_id:
+                return
+            self.catalog.create_folder(
+                f"Папка {target.name}",
+                [source_id, target_id],
+                anchor_app_id=target_id,
+            )
+            self._save_settings()
+            return
+        folder = next((item for item in self.catalog.folders if item.folder_id == target_id), None)
+        if folder is not None and source.folder_id != folder.folder_id:
+            self.catalog.move_to_folder(source_id, folder.folder_id)
+            self._save_settings()
+
+    def _open_folder(self, folder_id: str) -> None:
+        folder = next((item for item in self.catalog.folders if item.folder_id == folder_id), None)
+        if folder is None:
+            return
+        members = [
+            app for app_id in folder.app_ids
+            if (app := self.catalog.find(app_id)) is not None
+        ]
+        dialog = QDialog(self)
+        dialog.setObjectName("AppFolderDialog")
+        dialog.setWindowTitle(folder.name)
+        dialog.setWindowFlags(Qt.WindowType.Dialog | Qt.WindowType.FramelessWindowHint)
+        dialog.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
+        dialog.setMinimumSize(440, 340)
+        # Keep the folder non-modal so a click on another tile continues to
+        # that tile after this folder closes.
+        dialog.setModal(False)
+        outer = QVBoxLayout(dialog)
+        outer.setContentsMargins(12, 12, 12, 12)
+        surface = LiquidGlassWidget(
+            dialog,
+            radius=24,
+            opacity=self.settings.panel_opacity,
+            border_opacity=95,
         )
+        surface.setObjectName("AppFolderSurface")
+        surface.set_glass_thickness(self.settings.glass_thickness)
+        surface.set_matte_effect(self.settings.matte_effect)
+        surface.set_glass_color(self.settings.glass_color)
+        surface.set_panel_alpha(self.settings.panel_opacity)
+        surface.set_light_theme(self.theme.mode == ThemeMode.LIGHT)
+        outer.addWidget(surface)
+        layout = QVBoxLayout(surface)
+        layout.setContentsMargins(22, 18, 22, 22)
+        header = QHBoxLayout()
+        folder_text_color = "#1d2638" if self.theme.mode == ThemeMode.LIGHT else "#f5f7ff"
+        title = QLineEdit(folder.name, surface)
+        title.setObjectName("FolderTitleEditor")
+        title.setPlaceholderText("Название папки")
+        title.setClearButtonEnabled(False)
+        title.setMaxLength(48)
+        title.setStyleSheet(
+            f"QLineEdit {{ color: {folder_text_color}; font-size: 18px; font-weight: 700; "
+            "background: transparent; border: 1px solid transparent; padding: 3px; }"
+            "QLineEdit:focus { border-color: rgba(120,145,195,180); "
+            "border-radius: 6px; background: rgba(255,255,255,18); }"
+        )
+        title.editingFinished.connect(
+            lambda editor=title, current_folder=folder: self._rename_folder(
+                current_folder, editor.text(), editor
+            )
+        )
+        header.addWidget(title)
+        header.addStretch(1)
+        layout.addLayout(header)
+        layout.addWidget(QLabel("Измените название сверху. Дважды щёлкните приложение, чтобы открыть его.", surface))
+        scroll = QScrollArea(surface)
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.Shape.NoFrame)
+        contents = QWidget(scroll)
+        contents_layout = QGridLayout(contents)
+        contents_layout.setContentsMargins(4, 12, 4, 4)
+        contents_layout.setHorizontalSpacing(14)
+        contents_layout.setVerticalSpacing(10)
+        loading = QLabel("Открываем папку…", contents)
+        loading.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        contents_layout.addWidget(loading, 0, 0, 1, 3)
+        scroll.setWidget(contents)
+        layout.addWidget(scroll, 1)
+        dialog.setStyleSheet("""
+            QDialog#AppFolderDialog { background: transparent; }
+            QScrollArea, QScrollArea > QWidget > QWidget { background: transparent; border: none; }
+            QLabel { color: #d9dcef; background: transparent; border: none; }
+        """)
+        self._folder_dialog = dialog
+        dialog.finished.connect(
+            lambda _result, current_folder=folder, editor=title: self._rename_folder(
+                current_folder, editor.text(), editor
+            )
+        )
+        dialog.finished.connect(self._folder_dialog_finished)
+        self.panel.pause_backdrop()
+        dialog.adjustSize()
+        dialog.resize(max(440, dialog.width()), max(340, dialog.height()))
+        dialog.move(self.frameGeometry().center() - dialog.rect().center())
+        dialog.show()
+        dialog.raise_()
+        dialog.activateWindow()
+        QTimer.singleShot(
+            20,
+            lambda current_dialog=dialog, grid=contents_layout, apps=members, indicator=loading:
+                self._populate_folder_dialog(current_dialog, grid, apps, indicator),
+        )
+
+    def _populate_folder_dialog(
+        self,
+        dialog: QDialog,
+        layout: QGridLayout,
+        members: list[ApplicationItem],
+        loading: QLabel,
+    ) -> None:
+        """Build app cards after the folder window is visible."""
+        if not dialog.isVisible():
+            return
+        layout.removeWidget(loading)
+        loading.deleteLater()
+        self._populate_folder_dialog_batch(dialog, layout, members, 0)
+
+    def _populate_folder_dialog_batch(
+        self,
+        dialog: QDialog,
+        layout: QGridLayout,
+        members: list[ApplicationItem],
+        start_index: int,
+    ) -> None:
+        """Add a few app cards per event-loop turn to keep opening responsive."""
+        if not dialog.isVisible():
+            return
+        end_index = min(start_index + 6, len(members))
+        for index in range(start_index, end_index):
+            app = members[index]
+            card = AppCard(app, self.icon_cache, layout.parentWidget())
+            card.configure(
+                self._icon_pixels(self.settings.icon_size),
+                self.settings.font_size,
+                self.settings.show_labels,
+                self.settings.single_click_launch,
+            )
+            card.launched.connect(self.catalog.mark_opened)
+            card.launched.connect(dialog.accept)
+            card.pin_requested.connect(self._toggle_pin_for_app)
+            card.favorite_requested.connect(self._toggle_favorite_for_app)
+            card.remove_requested.connect(self._remove_app_from_moon)
+            layout.addWidget(card, index // 3, index % 3, Qt.AlignmentFlag.AlignCenter)
+        if end_index < len(members):
+            QTimer.singleShot(
+                10,
+                lambda: self._populate_folder_dialog_batch(
+                    dialog, layout, members, end_index
+                ),
+            )
+
+    def _rename_folder(self, folder: AppFolder, requested_name: str, editor: QLineEdit) -> None:
+        """Rename a folder and persist it without losing the previous name on blank input."""
+        name = requested_name.strip()
+        if not name:
+            editor.setText(folder.name)
+            return
+        if name == folder.name:
+            return
+        folder.name = name
+        if self._folder_dialog is not None:
+            self._folder_dialog.setWindowTitle(name)
+        self._save_settings()
+        self._schedule_refresh()
+
+    def _folder_dialog_finished(self, _result: int) -> None:
+        self._folder_dialog = None
+        QTimer.singleShot(120, self._resume_backdrop_if_menus_closed)
+
+    def _remove_app_from_moon(self, app_id: str) -> None:
+        app = self.catalog.find(app_id)
+        if app is None:
+            return
+        if not app.uninstall_command:
+            answer = QMessageBox.question(
+                self,
+                "Деинсталлятор не найден",
+                f'Для «{app.name}» Windows не зарегистрировала команду удаления. '
+                "Откройте список установленных приложений Windows и удалите программу там.",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.Cancel,
+                QMessageBox.StandardButton.Yes,
+            )
+            if answer == QMessageBox.StandardButton.Yes:
+                QDesktopServices.openUrl(QUrl("ms-settings:appsfeatures"))
+            return
+        answer = QMessageBox.question(
+            self,
+            "Удалить программу из Windows?",
+            f'Будет запущен деинсталлятор «{app.name}». '
+            "Приложение и его компоненты могут быть удалены из Windows.",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.Cancel,
+            QMessageBox.StandardButton.Cancel,
+        )
+        if answer != QMessageBox.StandardButton.Yes:
+            return
+        if app_id in self._uninstall_processes:
+            return
+        command = os.path.expandvars(app.uninstall_command)
+        if "msiexec" in command[:100].casefold():
+            command = re.sub(r"(?i)(^|\s)/i(?=\s*\{)", r"\1/x", command)
+        process = QProcess(self)
+        self._uninstall_processes[app_id] = process
+        process.finished.connect(
+            lambda exit_code, _status, target_id=app_id:
+                self._uninstall_finished(target_id, exit_code)
+        )
+        process.errorOccurred.connect(
+            lambda _error, target_id=app_id: self._uninstall_failed(target_id)
+        )
+        process.startCommand(command)
+
+    def _uninstall_finished(self, app_id: str, exit_code: int) -> None:
+        process = self._uninstall_processes.pop(app_id, None)
+        if process is None:
+            return
+        process.deleteLater()
+        if exit_code != 0:
+            self._uninstall_failed_message(app_id)
+            return
+        app = self.catalog.find(app_id)
+        if app is not None and windows_uninstall_registered(app.name):
+            QMessageBox.warning(
+                self,
+                "Удаление не подтверждено",
+                f'Windows всё ещё показывает «{app.name}» среди установленных программ. '
+                "Приложение оставлено в MOON.",
+            )
+            return
+        self._forget_uninstalled_app(app_id)
+
+    def _uninstall_failed(self, app_id: str) -> None:
+        process = self._uninstall_processes.pop(app_id, None)
+        if process is not None:
+            process.deleteLater()
+        self._uninstall_failed_message(app_id)
+
+    def _uninstall_failed_message(self, app_id: str) -> None:
+        app = self.catalog.find(app_id)
+        if app is not None:
+            QMessageBox.warning(
+                self,
+                "Не удалось удалить приложение",
+                f'Деинсталлятор «{app.name}» завершился с ошибкой. '
+                "Приложение оставлено в MOON.",
+            )
+
+    def _forget_uninstalled_app(self, app_id: str) -> None:
+        app = self.catalog.find(app_id)
+        if app is None:
+            return
+        key = self._storage_key(app.path)
+        if key not in {self._storage_key(path) for path in self.settings.hidden_app_paths}:
+            self.settings.hidden_app_paths.append(key)
+        self.settings.custom_apps = [
+            entry for entry in self.settings.custom_apps
+            if self._storage_key(str(entry.get("path", ""))) != key
+        ]
+        self.catalog.remove_application(app_id)
+        self._save_settings()
 
     def eventFilter(self, watched: object, event: QEvent) -> bool:
         if not self.isVisible():
@@ -1227,6 +1830,34 @@ class LaunchpadWindow(QMainWindow):
         if event.type() == QEvent.Type.MouseButtonPress:
             if hasattr(event, "globalPosition"):
                 point = event.globalPosition().toPoint()
+
+                folder_dialog = self._folder_dialog
+                if (
+                    folder_dialog is not None
+                    and folder_dialog.isVisible()
+                    and not folder_dialog.frameGeometry().contains(point)
+                ):
+                    folder_dialog.close()
+
+                settings_dialog = self._settings_dialog
+                if (
+                    settings_dialog is not None
+                    and settings_dialog.isVisible()
+                    and settings_dialog.frameGeometry().contains(point)
+                ):
+                    return super().eventFilter(watched, event)
+
+                about_dialog = self._about_dialog
+                if (
+                    about_dialog is not None
+                    and about_dialog.isVisible()
+                    and about_dialog.frameGeometry().contains(point)
+                ):
+                    return super().eventFilter(watched, event)
+
+                modal = QApplication.activeModalWidget()
+                if modal is not None and (modal is self or self.isAncestorOf(modal)):
+                    return super().eventFilter(watched, event)
 
                 if not self.frameGeometry().contains(point):
                     if self._popover is not None and self._popover.isVisible():
@@ -1243,10 +1874,12 @@ class LaunchpadWindow(QMainWindow):
 
     def event(self, event: QEvent) -> bool:
         if event.type() == QEvent.Type.WindowActivate:
+            self._focus_check_timer.stop()
+            self._focus_check_attempts = 0
             if self.theme.mode == ThemeMode.AUTO:
                 self._apply_theme()
 
         elif event.type() == QEvent.Type.WindowDeactivate:
-            self.hide()
+            self._schedule_focus_check()
 
         return super().event(event)

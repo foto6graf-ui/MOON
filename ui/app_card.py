@@ -35,8 +35,8 @@ class AppCard(QWidget):
     launched = Signal(str)
     pin_requested = Signal(str)
     favorite_requested = Signal(str)
-    folder_requested = Signal(str)
     drop_requested = Signal(str, str)
+    remove_requested = Signal(str)
 
     CARD_SIZE = QSize(76, 92)
     ICON_SIZE = 48
@@ -56,6 +56,7 @@ class AppCard(QWidget):
         self._content_opacity = 1.0
         self._pressed = False
         self._drag_start: QPoint | None = None
+        self._drag_started = False
         self._font_size = 11
         self._show_label = True
         self._single_click_launch = False
@@ -63,10 +64,10 @@ class AppCard(QWidget):
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
         self.setAutoFillBackground(False)
         self.setStyleSheet("background: transparent; border: none;")
-        self.setAcceptDrops(False)
+        self.setAcceptDrops(True)
         self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
         self.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.setToolTip(app.name)
+        #self.setToolTip(app.name)
 
     def sizeHint(self) -> QSize:
         return QSize(self.CARD_SIZE)
@@ -135,6 +136,7 @@ class AppCard(QWidget):
 
     def mousePressEvent(self, event: QMouseEvent) -> None:
         if event.button() == Qt.MouseButton.LeftButton:
+            self._drag_started = False
             self._pressed = True
             self._drag_start = event.position().toPoint()
             self._animate_state(0.97, 0.0, 0.6, 130)
@@ -154,11 +156,14 @@ class AppCard(QWidget):
         drag.setMimeData(mime)
         drag.setPixmap(self.grab())
         drag.setHotSpot(event.position().toPoint())
+        self._drag_started = True
         drag.exec(Qt.DropAction.MoveAction)
 
     def mouseReleaseEvent(self, event: QMouseEvent) -> None:
         self._pressed = False
-        if self._single_click_launch and event.button() == Qt.MouseButton.LeftButton:
+        dragged = self._drag_started
+        self._drag_started = False
+        if not dragged and self._single_click_launch and event.button() == Qt.MouseButton.LeftButton:
             self.open_application()
         self._animate_state(1.04 if self.underMouse() else 1.0, 0.0, 1.0 if self.underMouse() else 0.0)
         super().mouseReleaseEvent(event)
@@ -176,6 +181,7 @@ class AppCard(QWidget):
 
     def contextMenuEvent(self, event: object) -> None:
         menu = QMenu(self)
+        remove_action = QAction("Удалить в Windows…", menu)
         open_action = QAction("Открыть", menu)
         admin_action = QAction("Запустить от администратора", menu)
         properties_action = QAction("Показать в папке", menu)
@@ -186,6 +192,7 @@ class AppCard(QWidget):
         admin_action.triggered.connect(lambda: run_as_administrator(self.app.launch_target))
         properties_action.triggered.connect(lambda: reveal_in_file_manager(self.app.path))
         pin_action.triggered.connect(lambda: self.pin_requested.emit(self.app.item_id))
+        remove_action.triggered.connect(lambda: self.remove_requested.emit(self.app.item_id))
 
 
         for action in (
@@ -193,6 +200,7 @@ class AppCard(QWidget):
             admin_action,
             properties_action,
             pin_action,
+            remove_action,
 
         ):
             menu.addAction(action)

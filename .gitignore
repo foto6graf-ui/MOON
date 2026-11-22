@@ -15,6 +15,7 @@ env/
 # Build
 build/
 dist/
+Output/
 *.spec
 
 # Logs
@@ -26,3 +27,6 @@ Thumbs.db
 
 # Local settings
 settings.local.json
+.env
+server/data/
+tg_bot/.update_offset

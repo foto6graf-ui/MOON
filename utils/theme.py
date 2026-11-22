@@ -70,6 +70,6 @@ class ThemeController(QObject):
         return DARK_PALETTE if self._dark else LIGHT_PALETTE
 
     def set_mode(self, mode: ThemeMode) -> None:
-        self._mode = ThemeMode.DARK
-        self._dark = True
+        self._mode = ThemeMode(mode)
+        self._dark = self._mode != ThemeMode.LIGHT
         self.theme_changed.emit()

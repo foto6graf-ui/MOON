@@ -46,12 +46,12 @@ class GlassStyle:
     multiplied by the paint-time ``reveal`` factor so a panel can fade in.
     """
 
-    # Soft drop shadow: ``shadow_layers`` stacked rounded rects of growing spread.
-    shadow_layers: int = 14
-    shadow_step: float = 3.2
-    shadow_alpha: int = 5
-    shadow_top: float = 10.0       # vertical offset of the shadow's top edge
-    shadow_bottom: float = 16.0    # ...and its bottom edge (shadow sits below)
+    # Shadows are disabled by default for the flat MOON surface.
+    shadow_layers: int = 0
+    shadow_step: float = 0.0
+    shadow_alpha: int = 0
+    shadow_top: float = 0.0
+    shadow_bottom: float = 0.0
 
     # Interior tint (top → bottom white alpha) so the pane reads as a surface.
     tint_top: int = 16
@@ -76,6 +76,7 @@ def paint_glass(
     *,
     style: GlassStyle | None = None,
     reveal: float = 1.0,
+    color_tint: QColor | None = None,
 ) -> None:
     """Composite a finished glass panel into ``painter`` over ``rect``.
 
@@ -126,6 +127,10 @@ def paint_glass(
         sheen.setColorAt(0.0, QColor(255, 255, 255, int(style.sheen_alpha * reveal)))
         sheen.setColorAt(1.0, QColor(255, 255, 255, 0))
         painter.fillRect(rect, QBrush(sheen))
+    if color_tint is not None:
+        tint = QColor(color_tint)
+        tint.setAlpha(int(tint.alpha() * reveal))
+        painter.fillPath(path, tint)
     painter.restore()
 
     # Crisp Fresnel-ish rim line.
@@ -135,7 +140,13 @@ def paint_glass(
     rim.setColorAt(1.0, QColor(255, 255, 255, int(style.rim_bottom * reveal)))
     painter.setPen(QPen(QBrush(rim), style.rim_width))
     painter.setBrush(Qt.BrushStyle.NoBrush)
-    painter.drawRoundedRect(rect.adjusted(0.7, 0.7, -0.7, -0.7), radius, radius)
+    inset = 0.7
+    rim_radius = max(0.0, radius - inset)
+    painter.drawRoundedRect(
+        rect.adjusted(inset, inset, -inset, -inset),
+        rim_radius,
+        rim_radius,
+    )
 
 
 class GlassRenderer:
@@ -195,11 +206,26 @@ class GlassRenderer:
         *,
         fast: bool = False,
     ) -> QPixmap | None:
-        """Refract the slice of ``backdrop`` behind a panel at ``origin``.
+        img = self.refract_image(backdrop, origin, dpr, fast=fast)
+        if img is None:
+            return None
+        pm = QPixmap.fromImage(img)
+        pm.setDevicePixelRatio(dpr)
+        return pm
+
+    def refract_image(
+        self,
+        backdrop: np.ndarray,
+        origin: QPoint,
+        dpr: float,
+        *,
+        fast: bool = False,
+    ) -> QImage | None:
+        """Refract the backdrop slice into a detached QImage.
 
         ``origin`` is the panel's top-left in the backdrop's *logical* pixel
-        space (i.e. before multiplying by ``dpr``). ``fast=True`` skips the
-        frost scatter for a cheap sharp preview during a drag.
+        space. ``fast=True`` skips frost scatter. The returned image owns its
+        pixels and can safely cross from a worker thread to the UI thread.
         """
         self._ensure_kernel(dpr)
         pad, pw, ph = self._pad, self._pw, self._ph
@@ -211,6 +237,17 @@ class GlassRenderer:
         if 0 <= gx <= w - gw and 0 <= gy <= h - gh:
             padded = backdrop[gy:gy + gh, gx:gx + gw]
         else:
+            # Backdrop не полностью накрывает нужный прямоугольник. Если
+            # промах небольшой (край экрана) — клэмп нормально сгладит.
+            # Если промах огромный (панель только что переехала на другой
+            # монитор, а свежий кадр ещё не пришёл) — клэмп растянет один
+            # и тот же крайний столбец/строку через всю панель ("зеркало
+            # вдали"). В этом случае лучше пропустить кадр и оставить
+            # прежний, чем показать этот артефакт.
+            overreach_x = max(0 - gx, gx + gw - w, 0)
+            overreach_y = max(0 - gy, gy + gh - h, 0)
+            if overreach_x > pad or overreach_y > pad:
+                return None
             xs = np.clip(np.arange(gx, gx + gw), 0, w - 1)
             ys = np.clip(np.arange(gy, gy + gh), 0, h - 1)
             padded = backdrop[np.ix_(ys, xs)]
@@ -218,6 +255,4 @@ class GlassRenderer:
         self._out = self._kernel.apply(padded, scatter=not fast)
         img = QImage(self._out.data, pw, ph, pw * 4, QImage.Format.Format_RGBA8888)
         img.setDevicePixelRatio(dpr)
-        pm = QPixmap.fromImage(img)
-        pm.setDevicePixelRatio(dpr)
-        return pm
+        return img.copy()

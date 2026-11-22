@@ -5,6 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
+import re
 from typing import Iterable
 from time import time
 from uuid import uuid4
@@ -61,6 +62,7 @@ class ApplicationItem:
     app_user_model_id: str | None = None
     source_type: str = "user"
     item_id: str = field(default_factory=lambda: uuid4().hex)
+    uninstall_command: str | None = None
 
     @property
     def launch_target(self) -> str:
@@ -80,6 +82,7 @@ class AppFolder:
     name: str
     app_ids: list[str] = field(default_factory=list)
     folder_id: str = field(default_factory=lambda: uuid4().hex)
+    anchor_app_id: str | None = None
 
 
 class ApplicationCatalog(QObject):
@@ -146,6 +149,20 @@ class ApplicationCatalog(QObject):
         self._applications.append(app)
         self.applications_changed.emit()
 
+    def remove_application(self, app_id: str) -> ApplicationItem | None:
+        """Remove an application from the launcher catalog and its folders."""
+        app = self.find(app_id)
+        if app is None:
+            return None
+        self._applications.remove(app)
+        for folder in self._folders.values():
+            if app_id in folder.app_ids:
+                folder.app_ids.remove(app_id)
+        self._prune_folders()
+        self.folders_changed.emit()
+        self.applications_changed.emit()
+        return app
+
     def set_sort_mode(self, mode: SortMode) -> None:
         """Set ordering mode for filtered applications."""
         self._sort_mode = mode
@@ -181,14 +198,38 @@ class ApplicationCatalog(QObject):
         app.is_pinned = not app.is_pinned
         self.applications_changed.emit()
 
-    def create_folder(self, name: str, app_ids: Iterable[str]) -> AppFolder:
+    def create_folder(
+        self,
+        name: str,
+        app_ids: Iterable[str],
+        *,
+        anchor_app_id: str | None = None,
+    ) -> AppFolder:
         """Create a folder and assign the provided applications to it."""
-        folder = AppFolder(name=name, app_ids=list(dict.fromkeys(app_ids)))
+        clean_name = name.strip()
+        valid_ids = list(dict.fromkeys(
+            app_id for app_id in app_ids if self.find(app_id) is not None
+        ))
+        if not clean_name:
+            raise ValueError("Folder name cannot be empty")
+        if len(valid_ids) < 2:
+            raise ValueError("A folder requires at least two applications")
+        if anchor_app_id not in valid_ids:
+            anchor_app_id = valid_ids[0]
+        folder = AppFolder(
+            name=clean_name,
+            app_ids=valid_ids,
+            anchor_app_id=anchor_app_id,
+        )
         self._folders[folder.folder_id] = folder
         for app_id in folder.app_ids:
             app = self.find(app_id)
             if app is not None:
+                for previous in self._folders.values():
+                    if previous.folder_id != folder.folder_id and app_id in previous.app_ids:
+                        previous.app_ids.remove(app_id)
                 app.folder_id = folder.folder_id
+        self._prune_folders()
         self.folders_changed.emit()
         self.applications_changed.emit()
         return folder
@@ -198,6 +239,8 @@ class ApplicationCatalog(QObject):
         app = self.find(app_id)
         if app is None:
             return
+        if folder_id is not None and folder_id not in self._folders:
+            return
         app.folder_id = folder_id
         for folder in self._folders.values():
             if app_id in folder.app_ids and folder.folder_id != folder_id:
@@ -206,12 +249,27 @@ class ApplicationCatalog(QObject):
             folder = self._folders[folder_id]
             if app_id not in folder.app_ids:
                 folder.app_ids.append(app_id)
+        self._prune_folders()
         self.folders_changed.emit()
         self.applications_changed.emit()
 
     def find(self, app_id: str) -> ApplicationItem | None:
         """Find an application by its stable id."""
         return next((app for app in self._applications if app.item_id == app_id), None)
+
+    def _prune_folders(self) -> None:
+        """Remove folders that no longer contain at least two applications."""
+        for folder_id, folder in tuple(self._folders.items()):
+            folder.app_ids[:] = [app_id for app_id in folder.app_ids if self.find(app_id)]
+            if len(folder.app_ids) >= 2:
+                if folder.anchor_app_id not in folder.app_ids:
+                    folder.anchor_app_id = folder.app_ids[0]
+                continue
+            self._folders.pop(folder_id)
+            for app_id in folder.app_ids:
+                app = self.find(app_id)
+                if app is not None and app.folder_id == folder_id:
+                    app.folder_id = None
 
     def filtered(
         self,
@@ -229,14 +287,56 @@ class ApplicationCatalog(QObject):
         if favorites_only:
             items = [app for app in items if app.is_favorite]
         if normalized:
-            items = [
-                app
-                for app in items
-                if normalized in app.name.casefold()
-                or normalized in app.path.casefold()
-                or normalized in app.category.value.casefold()
-            ]
+            items = [app for app in items if self._matches_query(app, normalized)]
         return self._sort(items)
+
+    @staticmethod
+    def _matches_query(app: ApplicationItem, query: str) -> bool:
+        """Match display names, executable names and common short forms."""
+        fields = [app.name]
+        for value in (app.path, app.launch_target):
+            if value and "://" not in value:
+                candidate = Path(value)
+                fields.extend((candidate.name, candidate.stem))
+        if app.app_user_model_id:
+            fields.append(app.app_user_model_id)
+
+        values = [value.casefold() for value in fields if value]
+        compact_values = [re.sub(r"[^\w]+", "", value, flags=re.UNICODE) for value in values]
+        aliases = {
+            "\u0442\u0435\u0440\u043c\u0438\u043d\u0430\u043b": ("terminal", "command prompt", "cmd", "powershell", "console"),
+            "terminal": ("\u0442\u0435\u0440\u043c\u0438\u043d\u0430\u043b", "command prompt", "cmd", "powershell", "console"),
+            "\u043a\u043e\u043d\u0441\u043e\u043b\u044c": ("console", "terminal", "cmd", "powershell"),
+            "console": ("\u043a\u043e\u043d\u0441\u043e\u043b\u044c", "terminal", "cmd", "powershell"),
+            "\u043a\u043e\u043c\u0430\u043d\u0434\u043d\u0430\u044f \u0441\u0442\u0440\u043e\u043a\u0430": ("command prompt", "cmd", "terminal"),
+        }
+        query_forms = (query, *aliases.get(query, ()))
+        for form in query_forms:
+            compact_form = re.sub(r"[^\w]+", "", form, flags=re.UNICODE)
+            if any(form in value for value in values) or any(
+                compact_form and compact_form in value for value in compact_values
+            ):
+                return True
+
+        compact_query = re.sub(r"[^\w]+", "", query, flags=re.UNICODE)
+        if not compact_query:
+            return False
+
+        query_tokens = re.findall(r"\w+", query, flags=re.UNICODE)
+        candidate_tokens = [
+            token
+            for value in values
+            for token in re.findall(r"\w+", value, flags=re.UNICODE)
+        ]
+        if query_tokens and all(
+            any(candidate.startswith(token) for candidate in candidate_tokens)
+            for token in query_tokens
+        ):
+            return True
+
+        name_tokens = re.findall(r"\w+", app.name.casefold(), flags=re.UNICODE)
+        initials = "".join(token[0] for token in name_tokens if token)
+        return bool(compact_query and initials.startswith(compact_query))
 
     def _sort(self, items: list[ApplicationItem]) -> list[ApplicationItem]:
         def prefix(app: ApplicationItem) -> tuple[int, int]:
